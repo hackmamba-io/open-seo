@@ -79,6 +79,10 @@ import {
   runSiteAuditTool,
 } from "@/server/mcp/tools/site-audit-tools";
 import { whoamiTool } from "@/server/mcp/tools/whoami";
+import {
+  exploreAiPromptTool,
+  getAiBrandVisibilityTool,
+} from "@/server/mcp/tools/ai-search-tools";
 
 type ToolSchema = z.ZodType | z.ZodRawShape;
 
@@ -142,7 +146,7 @@ export function createOpenSeoMcpServer(authProps: McpProps) {
       title: "OpenSEO",
       version: "0.0.12",
       description:
-        "SEO research tools for AI agents: keyword research and metrics, SERP and local SERP results, domain and backlink analysis, rank tracking, and Google Search Console performance.",
+        "SEO and AI visibility research tools for AI agents: keyword research and metrics, SERP and local SERP results, domain and backlink analysis, rank tracking, AI answer visibility, and Google Search Console performance.",
       websiteUrl: "https://openseo.so",
       icons: [
         {
@@ -214,6 +218,8 @@ export function createOpenSeoMcpServer(authProps: McpProps) {
   register(getAuditStatusTool);
   register(getAuditIssuesTool);
   register(getAuditPagesTool);
+  register(getAiBrandVisibilityTool);
+  register(exploreAiPromptTool);
   register(saveReportTool);
   register(listReportsTool);
   register(getReportTool);
