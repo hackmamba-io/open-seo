@@ -18,7 +18,9 @@ five minutes. Keep the existing data volume and authentication/reverse-proxy
 configuration. Moving to `deploy/standalone/` is a separate data migration and
 is not required for Prompt Tracking.
 
-Build the fork on the target server, from the reviewed update commit:
+Build the fork in a separate checkout on the target server, from the reviewed
+update commit. Leave the running deployment directory unchanged until its
+backup has been taken:
 
 ```sh
 docker build -f deploy/docker/Dockerfile -t hackmamba-open-seo:0.1.24 .
@@ -26,9 +28,8 @@ docker build -f deploy/docker/Dockerfile -t hackmamba-open-seo:0.1.24 .
 
 The default Compose image is `ghcr.io/every-app/open-seo:latest`. It does not
 include this fork's two custom MCP tools. Upstream's Docker publish workflow
-also skips forks. Set `OPEN_SEO_IMAGE=hackmamba-open-seo:0.1.24` in the server's
-existing `.env`, preserving its other settings, before recreating the service.
-Do not rely on an upstream image pull to deliver the fork's changes.
+also skips forks. The service must explicitly use the fork's image after the
+backup below. Do not rely on an upstream image pull to deliver these changes.
 
 ## Back up and start the new image
 
@@ -42,14 +43,19 @@ frodo_backup_dir="$PWD/../frodo-backup-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -m 700 "$frodo_backup_dir"
 docker inspect --format '{{.Image}}' "$frodo_container" > "$frodo_backup_dir/image-id"
 cp .env "$frodo_backup_dir/env"
+cp compose.yaml "$frodo_backup_dir/compose.yaml"
 chmod 600 "$frodo_backup_dir/env"
 docker compose stop open-seo
 docker cp "$frodo_container":/app/.wrangler "$frodo_backup_dir/wrangler"
 ```
 
-Confirm that the backup contains the database and storage state. Retain the
-previous image and deployment configuration. With the new image pinned in
-`.env`, recreate only the application service:
+Confirm that the backup contains the database and storage state. Also retain
+the previous image and any active Compose overrides, reverse-proxy configuration
+and external secret configuration. Only after backing up the original files,
+set `OPEN_SEO_IMAGE=hackmamba-open-seo:0.1.24` in the existing deployment's `.env`,
+preserving its other settings. Update the deployment files for the new checkout
+without changing its Compose project name or volume mapping, then recreate only
+the application service:
 
 ```sh
 docker compose up -d --no-deps open-seo
