@@ -64,6 +64,25 @@ jobs:
       - name: Build website
         run: pnpm --dir web run build
 
+  frodo-deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Test deployment failure and recovery
+        run: python3 -m unittest discover -s deploy/frodo -p 'test_*.py' -v
+
+      - name: Exercise Docker deployment and SQLite rollback
+        run: python3 deploy/frodo/integration.py
+
+      - name: Check receiver installer
+        run: shellcheck deploy/frodo/install.sh
+
   docker-build:
     runs-on: ubuntu-latest
 

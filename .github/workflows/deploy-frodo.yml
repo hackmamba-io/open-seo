@@ -1,0 +1,131 @@
+name: Deploy Frodo
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+# A cancelled SSH client must never interrupt a database migration or restore.
+concurrency:
+  group: frodo-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.repository == 'hackmamba-io/open-seo' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+        (github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.event == 'push' &&
+         github.event.workflow_run.head_branch == 'main' &&
+         github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: frodo
+      url: https://frodo.hackmamba.io
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Require successful main CI and skip superseded commits
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision=$(git rev-parse HEAD)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$latest" != "$revision" ]]; then
+            echo "A newer commit is on main; this release is superseded."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A manual dispatch follows the same CI requirement as an automatic run.
+          passed=$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main -f event=push -f status=success -f head_sha="$revision" \
+            --jq '.workflow_runs | length')
+          if [[ "$passed" -eq 0 ]]; then
+            echo "::error::This main commit has no successful CI run."
+            exit 1
+          fi
+          version=$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          printf 'revision=%s\nversion=%s\ndeploy=true\n' "$revision" "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Test deployment failure and recovery paths
+        if: steps.release.outputs.deploy == 'true'
+        run: python3 -m unittest discover -s deploy/frodo -p 'test_*.py' -v
+
+      - name: Set up Buildx
+        if: steps.release.outputs.deploy == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Frodo legacy image
+        if: steps.release.outputs.deploy == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: hackmamba/open-seo:git-${{ steps.release.outputs.revision }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.release.outputs.revision }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+          cache-from: type=gha,scope=frodo
+          cache-to: type=gha,mode=max,scope=frodo
+
+      - name: Transfer and deploy
+        if: steps.release.outputs.deploy == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ steps.release.outputs.revision }}
+          VERSION: ${{ steps.release.outputs.version }}
+          FRODO_HOST: ${{ vars.FRODO_HOST }}
+          FRODO_SSH_PRIVATE_KEY: ${{ secrets.FRODO_SSH_PRIVATE_KEY }}
+          FRODO_SSH_KNOWN_HOSTS: ${{ secrets.FRODO_SSH_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$FRODO_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+$ ]]
+          test -n "$FRODO_SSH_PRIVATE_KEY"
+          test -n "$FRODO_SSH_KNOWN_HOSTS"
+          key="$RUNNER_TEMP/frodo-key"
+          known_hosts="$RUNNER_TEMP/frodo-known-hosts"
+          archive="$RUNNER_TEMP/frodo-image.tar.gz"
+          trap 'rm -f "$key" "$known_hosts" "$archive"' EXIT
+          printf '%s\n' "$FRODO_SSH_PRIVATE_KEY" > "$key"
+          printf '%s\n' "$FRODO_SSH_KNOWN_HOSTS" > "$known_hosts"
+          # No application secrets enter this build or the GitHub environment.
+          docker save "hackmamba/open-seo:git-$REVISION" | gzip -1 > "$archive"
+          archive_sha=$(sha256sum "$archive" | cut -d' ' -f1)
+          archive_bytes=$(stat -c %s "$archive")
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [[ "$latest" != "$REVISION" ]]; then
+            echo "A newer commit reached main during the build; skipping this release."
+            exit 0
+          fi
+          ssh -T -i "$key" \
+            -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+            -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=60 \
+            "frodo-deploy@$FRODO_HOST" \
+            "deploy $REVISION $VERSION $archive_sha $archive_bytes" < "$archive"
+          printf 'Deployed %s (OpenSEO %s) to [Frodo](https://frodo.hackmamba.io/).\n' \
+            "$REVISION" "$VERSION" >> "$GITHUB_STEP_SUMMARY"

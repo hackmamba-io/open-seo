@@ -1,9 +1,16 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
 const INTERVAL_MS = 5 * 60_000;
 const REQUEST_TIMEOUT_MS = 150_000;
+// A deployment owns this durable marker until the candidate is accepted.
+// Keep it in the data volume so a restart cannot accidentally resume paid work.
+const PAUSE_FILE = new URL(
+  "../.wrangler/.openseo-deploy-pause",
+  import.meta.url,
+);
 
 /** @param {string | number} port */
 export function scheduledUrl(port) {
@@ -59,7 +66,8 @@ async function sleep(ms, signal) {
 /**
  * Serial loop: never starts a second request while one is outstanding.
  * @param {{port: string | number, signal: AbortSignal, fetchImpl?: typeof fetch,
- * sleepImpl?: typeof sleep, log?: (message: string) => void}} options
+ * sleepImpl?: typeof sleep, isPaused?: () => boolean,
+ * log?: (message: string) => void}} options
  */
 export async function runSelfhostScheduler(options) {
   const {
@@ -67,6 +75,7 @@ export async function runSelfhostScheduler(options) {
     signal,
     fetchImpl = fetch,
     sleepImpl = sleep,
+    isPaused = () => existsSync(PAUSE_FILE),
     log = console.warn,
   } = options;
   const health = new URL("/api/health", scheduledUrl(port));
@@ -90,11 +99,13 @@ export async function runSelfhostScheduler(options) {
     throw new Error("Local preview did not become ready for scheduled work.");
   while (!signal.aborted) {
     const nextTick = Date.now() + INTERVAL_MS;
-    const ok = await triggerScheduled(port, { signal, fetchImpl });
-    if (!ok && !signal.aborted)
-      log(
-        "[scheduler] Local scheduled handler failed; retrying at the next five-minute tick.",
-      );
+    if (!isPaused()) {
+      const ok = await triggerScheduled(port, { signal, fetchImpl });
+      if (!ok && !signal.aborted)
+        log(
+          "[scheduler] Local scheduled handler failed; retrying at the next five-minute tick.",
+        );
+    }
     if (!signal.aborted)
       await sleepImpl(Math.max(0, nextTick - Date.now()), signal);
   }

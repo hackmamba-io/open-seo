@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import {
   runSelfhostScheduler,
   scheduledUrl,
@@ -123,5 +124,45 @@ describe("Docker local scheduler", () => {
       sleepImpl,
     });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+  it("holds scheduled work behind the durable deployment marker and resumes after acceptance", async () => {
+    const pause = new URL(
+      "../../../.wrangler/.openseo-deploy-pause",
+      import.meta.url,
+    );
+    mkdirSync(new URL("../../../.wrangler/", import.meta.url), {
+      recursive: true,
+    });
+    writeFileSync(pause, "deployment validation", { flag: "wx" });
+    const stop = new AbortController();
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (url) =>
+        url instanceof URL && url.pathname === "/api/health"
+          ? new Response(null, { status: 200 })
+          : Response.json({ outcome: "ok" }),
+      );
+    let ticks = 0;
+    try {
+      await runSelfhostScheduler({
+        port: 3001,
+        signal: stop.signal,
+        fetchImpl,
+        sleepImpl: async () => {
+          ticks++;
+          if (ticks === 1) {
+            expect(fetchImpl).toHaveBeenCalledTimes(1);
+            rmSync(pause);
+          } else stop.abort();
+        },
+      });
+      expect(
+        fetchImpl.mock.calls.map(([url]) =>
+          url instanceof URL ? url.pathname : "invalid",
+        ),
+      ).toEqual(["/api/health", "/cdn-cgi/handler/scheduled"]);
+    } finally {
+      rmSync(pause, { force: true });
+    }
   });
 });

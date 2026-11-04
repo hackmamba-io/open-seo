@@ -1,0 +1,7 @@
+# Imported inside the existing frodo.hackmamba.io site block.
+@frodoDeploy file {
+	root /opt/frodo-deploy-gate
+	try_files maintenance
+}
+header @frodoDeploy X-Frodo-Deployment maintenance
+respond @frodoDeploy "Frodo deployment in progress" 503
