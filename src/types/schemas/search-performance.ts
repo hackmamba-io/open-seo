@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+  optionalSearchPositiveIntParam,
+  searchTextParam,
+} from "@/types/schemas/domain";
 
 /** Date ranges offered by the Search Performance page. A deliberate subset of
  *  the GSC agent ranges (GSC_DATE_RANGES in searchAnalytics.ts); assignability
@@ -8,6 +12,15 @@ export const SEARCH_PERFORMANCE_RANGES = [
   "last_28_days",
   "last_3_months",
 ] as const;
+
+/** Search Console reports the page offers. Discover and Google News have no
+ *  query dimension and no position, so those views show pages only. */
+export const SEARCH_PERFORMANCE_TYPES = [
+  "web",
+  "discover",
+  "googleNews",
+] as const;
+export type SearchPerformanceType = (typeof SEARCH_PERFORMANCE_TYPES)[number];
 
 /** Device values exactly as the GSC `device` dimension returns/accepts them. */
 export const GSC_DEVICES = ["DESKTOP", "MOBILE", "TABLET"] as const;
@@ -19,7 +32,20 @@ export type SearchPerformanceDevice = (typeof GSC_DEVICES)[number];
 // Shared report/table filters. Spread into each request schema so the overview
 // and the paginated table calls always accept the exact same filter surface.
 const searchPerformanceFilterShape = {
+  pageFilter: z
+    .object({
+      operator: z.enum(["contains", "equals"]),
+      expression: z.string().trim().min(1).max(4096),
+    })
+    .optional(),
+  queryFilter: z
+    .object({
+      operator: z.enum(["contains", "equals"]),
+      expression: z.string().trim().min(1).max(4096),
+    })
+    .optional(),
   projectId: z.string().min(1),
+  searchType: z.enum(SEARCH_PERFORMANCE_TYPES).default("web"),
   dateRange: z.enum(SEARCH_PERFORMANCE_RANGES).default("last_28_days"),
   device: z.enum(GSC_DEVICES).optional(),
   // ISO-3166-1 alpha-3, the code GSC returns in `country` dimension keys.
@@ -61,3 +87,40 @@ export const searchPerformanceTableExportInputSchema = z.object({
   ...searchPerformanceFilterShape,
   dimension: z.enum(SEARCH_PERFORMANCE_TABLE_DIMENSIONS),
 });
+
+export const SEARCH_PERFORMANCE_TABS = [
+  "striking",
+  "queries",
+  "pages",
+] as const;
+export type SearchPerformanceTab = (typeof SEARCH_PERFORMANCE_TABS)[number];
+
+const textMatchParam = z
+  .enum(["contains", "equals"])
+  .optional()
+  .catch(undefined);
+
+/** /p/$projectId/search-performance query params. */
+export const searchPerformanceSearchSchema = z.object({
+  tab: z.enum(SEARCH_PERFORMANCE_TABS).optional().catch(undefined),
+  type: z.enum(SEARCH_PERFORMANCE_TYPES).optional().catch(undefined),
+  range: z.enum(SEARCH_PERFORMANCE_RANGES).optional().catch(undefined),
+  device: z.enum(GSC_DEVICES).optional().catch(undefined),
+  country: z.string().length(3).optional().catch(undefined),
+  pageText: searchTextParam,
+  pageMatch: textMatchParam,
+  queryText: searchTextParam,
+  queryMatch: textMatchParam,
+  page: optionalSearchPositiveIntParam,
+  size: z.coerce
+    .number()
+    .refine((value) =>
+      (SEARCH_PERFORMANCE_PAGE_SIZES as readonly number[]).includes(value),
+    )
+    .optional()
+    .catch(undefined),
+});
+
+export type SearchPerformanceSearch = z.infer<
+  typeof searchPerformanceSearchSchema
+>;

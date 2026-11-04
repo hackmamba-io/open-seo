@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   BROKEN_LINKS_SQL,
+  FRONTIER_DISCOVER_SQL,
   ORPHAN_PAGES_SQL,
   SCRATCHPAD_SCHEMA_SQL,
 } from "@/server/features/audit/scratchpad-sql";
@@ -65,10 +66,15 @@ beforeEach(() => {
 });
 
 describe("broken internal links", () => {
-  it("reports a crawled-and-failed target once, with its status", () => {
+  it("reports a crawled-and-failed target once, ignoring fine and uncrawled targets", () => {
     addPage("p1", START);
     addPage("p2", "https://site.test/gone", { status: 404 });
-    addLinks("p1", START, ["https://site.test/gone"]);
+    addPage("p3", "https://site.test/ok");
+    addLinks("p1", START, [
+      "https://site.test/gone",
+      "https://site.test/ok",
+      "https://site.test/never-crawled",
+    ]);
 
     expect(brokenLinks()).toEqual([
       {
@@ -78,17 +84,6 @@ describe("broken internal links", () => {
         target_status: 404,
       },
     ]);
-  });
-
-  it("ignores targets that were never crawled and targets that are fine", () => {
-    addPage("p1", START);
-    addPage("p2", "https://site.test/ok");
-    addLinks("p1", START, [
-      "https://site.test/ok",
-      "https://site.test/never-crawled",
-    ]);
-
-    expect(brokenLinks()).toEqual([]);
   });
 
   it("ignores WAF-blocked 4xx targets", () => {
@@ -134,10 +129,11 @@ describe("broken internal links", () => {
 });
 
 describe("orphan pages", () => {
-  it("flags a 2xx page nothing links to", () => {
+  it("flags a 2xx page nothing links to, not the start URL or a linked page", () => {
     addPage("p1", START);
     addPage("p2", "https://site.test/lonely");
-    addLinks("p1", START, ["https://site.test/other"]);
+    addPage("p3", "https://site.test/linked");
+    addLinks("p1", START, ["https://site.test/linked"]);
 
     expect(orphanPages()).toEqual([
       { page_id: "p2", url: "https://site.test/lonely" },
@@ -154,14 +150,6 @@ describe("orphan pages", () => {
     ]);
   });
 
-  it("does not flag a page linked from another page", () => {
-    addPage("p1", START);
-    addPage("p2", "https://site.test/linked");
-    addLinks("p1", START, ["https://site.test/linked"]);
-
-    expect(orphanPages()).toEqual([]);
-  });
-
   it("does not flag a page something redirects to", () => {
     addPage("p1", START);
     addPage("p2", "https://site.test/target");
@@ -169,12 +157,6 @@ describe("orphan pages", () => {
       status: 301,
       redirectUrl: "https://site.test/target",
     });
-
-    expect(orphanPages()).toEqual([]);
-  });
-
-  it("never flags the start URL", () => {
-    addPage("p1", START);
 
     expect(orphanPages()).toEqual([]);
   });
@@ -248,5 +230,26 @@ describe("query plans", () => {
     ).toBe(true);
     // page_mirror is scanned once as the outer loop, never per inbound row.
     expect(detail.filter((line) => /SCAN m\b/.test(line))).toHaveLength(1);
+  });
+});
+
+describe("frontier link discovery", () => {
+  // Seeding covers the whole sitemap, so most linked pages already have a
+  // sitemap row. A link must still give them a click depth and link-queue
+  // priority, or the deep-page check and breadth-first crawl order go blind.
+  it("gives a pending sitemap seed the link's depth and priority, keeping its sitemap flag", () => {
+    const url = "https://site.test/post";
+    db.prepare(
+      `INSERT INTO frontier (url, depth, source, in_sitemap) VALUES (?, NULL, 'sitemap', 1)`,
+    ).run(url);
+
+    db.prepare(FRONTIER_DISCOVER_SQL).run(url, 2);
+    db.prepare(FRONTIER_DISCOVER_SQL).run(url, 3);
+
+    expect(
+      db
+        .prepare(`SELECT depth, source, in_sitemap FROM frontier WHERE url = ?`)
+        .get(url),
+    ).toEqual({ depth: 2, source: "link", in_sitemap: 1 });
   });
 });

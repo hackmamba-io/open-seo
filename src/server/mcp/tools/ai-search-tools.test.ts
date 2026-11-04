@@ -116,13 +116,13 @@ const promptResult = {
       brandMentioned: true,
       outputTokens: 42,
       webSearch: true,
+      webSearchCountryCode: "GB",
     },
   ],
 };
 
 describe("AI Search MCP tools", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.getProjectForOrganization.mockResolvedValue({
       id: "project_1",
       locationCode: 2826,
@@ -190,7 +190,7 @@ describe("AI Search MCP tools", () => {
         models: ["perplexity"],
         highlightBrand: "Hackmamba",
         webSearch: true,
-        webSearchCountryCode: undefined,
+        webSearchCountryCode: "GB",
       },
       expect.objectContaining({ projectId: "project_1" }),
     );

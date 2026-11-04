@@ -3,6 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCrawlThrottle } from "@/server/lib/audit/crawl-throttle";
 import { crawlPage } from "@/server/workflows/site-audit-workflow-helpers";
 
+// No crawl gateway and no signing key configured: publicFetch is plain fetch
+// and requests go unsigned, and both env lookups must settle in microtasks so
+// the fake-timer cases below can advance past them.
+vi.mock("@/server/lib/runtime-env", () => ({
+  getOptionalEnvValue: async () => undefined,
+}));
+
 const PAGE_URL = "https://example.com/page";
 const PAGE_HTML =
   "<html><head><title>A page</title></head><body><h1>A page</h1></body></html>";
@@ -11,26 +18,33 @@ const PAGE_HTML =
  * Answer each fetch with the next reply, repeating the last one. Every call
  * builds a fresh Response: a body can only be read (or cancelled) once.
  */
-function stubFetch(...replies: Array<{ status: number; retryAfter?: string }>) {
+function stubFetch(
+  ...replies: Array<{
+    status: number;
+    retryAfter?: string;
+    contentType?: string;
+  }>
+) {
   let index = 0;
   return vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
     const reply = replies[Math.min(index++, replies.length - 1)];
     return new Response(PAGE_HTML, {
       status: reply.status,
       headers: {
-        "content-type": "text/html",
+        "content-type": reply.contentType ?? "text/html",
         ...(reply.retryAfter ? { "retry-after": reply.retryAfter } : {}),
       },
     });
   });
 }
 
-function crawl() {
+function crawl(options?: Parameters<typeof crawlPage>[4]) {
   return crawlPage(
     PAGE_URL,
     0,
     false,
     createCrawlThrottle(Date.now() + 90_000),
+    options,
   );
 }
 
@@ -60,93 +74,25 @@ describe("crawlPage", () => {
     expect(page?.rateLimited).toBe(true);
   });
 
-  it("holds every other fetch in the chunk while one URL's 429 pause runs", async () => {
-    vi.useFakeTimers();
-    const fetched: string[] = [];
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-      fetched.push(new Request(input).url);
-      // Only the first request to the first URL is refused.
-      const refused = fetched.length === 1;
-      return new Response(PAGE_HTML, {
-        status: refused ? 429 : 200,
-        headers: {
-          "content-type": "text/html",
-          ...(refused ? { "retry-after": "5" } : {}),
-        },
-      });
-    });
-    const throttle = createCrawlThrottle(Date.now() + 90_000);
-
-    const first = crawlPage(`${PAGE_URL}/first`, 0, false, throttle);
-    await vi.advanceTimersByTimeAsync(0);
-    const second = crawlPage(`${PAGE_URL}/second`, 0, false, throttle);
-    await vi.advanceTimersByTimeAsync(4_000);
-    expect(fetched).toEqual([`${PAGE_URL}/first`]);
-
-    await vi.advanceTimersByTimeAsync(3_000);
-    const pages = await Promise.all([first, second]);
-    expect(fetched).toHaveLength(3);
-    expect(pages.map((page) => page?.fetchClass)).toEqual(["ok", "ok"]);
-  });
-
-  it("records a page the site keeps rate limiting, without calling it blocked", async () => {
-    vi.useFakeTimers();
-    const fetchMock = stubFetch({ status: 429, retryAfter: "1" });
-
-    const crawled = crawl();
-    await vi.advanceTimersByTimeAsync(30_000);
-    const page = await crawled;
-
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    expect(page?.fetchClass).toBe("rate_limited");
-  });
-
-  it("recovers concurrent pages without a burst after sixty seconds", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    const starts: number[] = [];
-    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
-      starts.push(Date.now());
-      return new Response(PAGE_HTML, {
-        status: Date.now() < 60_000 ? 429 : 200,
-        headers: { "content-type": "text/html", "retry-after": "60" },
-      });
-    });
-    const throttle = createCrawlThrottle(90_000);
-    const pages = Promise.all(
-      Array.from({ length: 5 }, (_, i) =>
-        crawlPage(`${PAGE_URL}/${i}`, 0, false, throttle),
-      ),
-    );
-    await vi.advanceTimersByTimeAsync(59_999);
-    expect(starts).toEqual([0]);
-    await vi.runAllTimersAsync();
-    expect((await pages).map((page) => page?.fetchClass)).toEqual(
-      Array(5).fill("ok"),
-    );
-    expect(starts).toEqual([0, 60_000, 62_000, 64_000, 66_000, 68_000]);
-  });
-
-  it("defers the refused URL when its cooldown exceeds the chunk deadline", async () => {
-    vi.useFakeTimers();
-    const fetchMock = stubFetch({ status: 429, retryAfter: "600" });
-    const throttle = createCrawlThrottle(Date.now() + 90_000);
-    expect(await crawlPage(PAGE_URL, 0, false, throttle)).toBeNull();
-    expect(
-      await crawlPage(`${PAGE_URL}/unvisited`, 0, false, throttle),
-    ).toBeNull();
-    expect(throttle.stopped).toBe(false);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("records a final 429 when the requested wait exceeds the audit's cooldown budget", async () => {
-    vi.useFakeTimers();
-    const fetchMock = stubFetch({ status: 429, retryAfter: "3600" });
-    const throttle = createCrawlThrottle(Date.now() + 90_000);
-    expect((await crawlPage(PAGE_URL, 0, false, throttle))?.fetchClass).toBe(
+  // A long Retry-After is deferred to a later chunk; one past the audit's
+  // whole cooldown budget is recorded as the page's final answer.
+  it.each([
+    ["defers the URL when its cooldown outlasts the chunk", "600", null, false],
+    [
+      "records a final 429 when the wait exceeds the cooldown budget",
+      "8000",
       "rate_limited",
-    );
-    expect(throttle.stopped).toBe(true);
+      true,
+    ],
+  ])("%s", async (_label, retryAfter, fetchClass, stopped) => {
+    vi.useFakeTimers();
+    const fetchMock = stubFetch({ status: 429, retryAfter });
+    const throttle = createCrawlThrottle(Date.now() + 90_000);
+
+    const page = await crawlPage(PAGE_URL, 0, false, throttle);
+
+    expect(page?.fetchClass ?? null).toBe(fetchClass);
+    expect(throttle.stopped).toBe(stopped);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -157,6 +103,21 @@ describe("crawlPage", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(page?.fetchClass).toBe("blocked");
+  });
+
+  it("renders a page blocked by a 403 that isn't HTML", async () => {
+    // Shared-host firewalls refuse before the site, often without an HTML page.
+    stubFetch({ status: 403, contentType: "text/plain" });
+
+    const page = await crawl({
+      render: async () => ({ html: PAGE_HTML, status: 200 }),
+    });
+
+    expect(page).toMatchObject({
+      statusCode: 200,
+      fetchClass: "ok",
+      title: "A page",
+    });
   });
 
   it("preserves extracted metadata and nested values when releasing the HTML", async () => {

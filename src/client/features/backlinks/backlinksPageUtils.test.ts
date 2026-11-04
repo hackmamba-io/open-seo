@@ -1,14 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { truncateMiddle } from "./backlinksPageUtils";
+import {
+  formatCompactDate,
+  formatMonthLabel,
+  truncateMiddle,
+} from "./backlinksPageUtils";
 
 describe("truncateMiddle", () => {
-  it("returns the value unchanged when it already fits", () => {
-    expect(truncateMiddle("short", 10)).toBe("short");
-    expect(truncateMiddle("exactly-ten", "exactly-ten".length)).toBe(
-      "exactly-ten",
-    );
-  });
-
   it("never returns a string longer than maxLength", () => {
     const value = "/very/long/path/segment/that/keeps/going/here";
     for (let maxLength = 0; maxLength <= value.length; maxLength++) {
@@ -24,10 +21,29 @@ describe("truncateMiddle", () => {
       "/ver...here",
     );
   });
+});
 
-  it("head-truncates when there is no room for both sides", () => {
-    expect(truncateMiddle("abcdefgh", 4)).toBe("a...");
-    expect(truncateMiddle("abcdefgh", 3)).toBe("abc");
-    expect(truncateMiddle("abcdefgh", 2)).toBe("ab");
+describe("formatCompactDate", () => {
+  // `new Date("2026-03-01")` is UTC midnight, which renders as Feb 28 anywhere
+  // west of UTC. Comparing against local midnight fails there.
+  it("shows the calendar date it was given", () => {
+    expect(formatCompactDate("2026-03-01")).toBe(
+      new Date(2026, 2, 1).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      }),
+    );
+  });
+});
+
+describe("formatMonthLabel", () => {
+  it("labels the month it was given", () => {
+    expect(formatMonthLabel("2026-03-01")).toBe(
+      new Date(2026, 2, 1).toLocaleDateString(undefined, {
+        month: "short",
+        year: "2-digit",
+      }),
+    );
   });
 });

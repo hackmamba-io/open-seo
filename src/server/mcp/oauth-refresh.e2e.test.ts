@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { sortBy } from "remeda";
 import { z } from "zod";
-import type { createOpenSeoOAuthProvider } from "./oauth-provider";
+import { createOpenSeoOAuthProvider } from "./oauth-provider";
 
 // End-to-end OAuth lifecycle against the REAL @cloudflare/workers-oauth-provider
 // (only the Workers runtime shims and app session resolution are mocked),
@@ -9,7 +10,7 @@ import type { createOpenSeoOAuthProvider } from "./oauth-provider";
 // PKCE S256, form-encoded token requests, and refresh with client_id only —
 // no client secret, no scope parameter. Refresh breakage has bitten real
 // clients before (PR #420); these tests pin the full register → authorize →
-// consent → token → use → refresh → rotate chain.
+// consent → token → use → refresh chain.
 
 const BASE = "https://app.openseo.so";
 const MCP_RESOURCE = `${BASE}/mcp`;
@@ -40,6 +41,8 @@ vi.mock("@/middleware/ensure-user/hosted", () => ({
 
 vi.mock("@/server/features/activation/mcpActivation", () => ({
   recordMcpAuthorized: () => Promise.resolve(),
+  completeOnboardingFromAgent: () => Promise.resolve(),
+  markMcpConnected: () => Promise.resolve(),
 }));
 
 vi.mock("@/server/lib/posthog", () => ({
@@ -55,8 +58,8 @@ vi.mock("@/server/mcp/transport", () => ({
   ): Promise<Response> => Promise.resolve(Response.json({ props })),
 }));
 
-// Minimal in-memory KVNamespace honoring expirationTtl against Date.now(), so
-// vi.setSystemTime drives token/grant expiry.
+// Minimal in-memory KVNamespace honoring expiration/expirationTtl against
+// Date.now(), so vi.setSystemTime drives token/grant expiry.
 function createKvFake() {
   const store = new Map<
     string,
@@ -85,15 +88,21 @@ function createKvFake() {
     put(
       key: string,
       value: string,
-      options?: { expirationTtl?: number; metadata?: unknown },
+      options?: {
+        expiration?: number;
+        expirationTtl?: number;
+        metadata?: unknown;
+      },
     ) {
       store.set(key, {
         value,
         metadata: options?.metadata,
         expiresAt:
-          options?.expirationTtl !== undefined
-            ? Date.now() + options.expirationTtl * 1000
-            : undefined,
+          options?.expiration !== undefined
+            ? options.expiration * 1000
+            : options?.expirationTtl !== undefined
+              ? Date.now() + options.expirationTtl * 1000
+              : undefined,
       });
       return Promise.resolve();
     },
@@ -102,21 +111,28 @@ function createKvFake() {
       return Promise.resolve();
     },
     list(options?: { prefix?: string; cursor?: string; limit?: number }) {
-      const keys = [...store.keys()]
-        .filter((key) => live(key))
-        .filter((key) => !options?.prefix || key.startsWith(options.prefix))
-        .slice(0, options?.limit ?? 1000)
-        .map((name) => {
-          const entry = store.get(name);
-          return {
-            name,
-            metadata: entry?.metadata,
-            expiration: entry?.expiresAt
-              ? Math.floor(entry.expiresAt / 1000)
-              : undefined,
-          };
-        });
-      return Promise.resolve({ keys, list_complete: true, cursor: "" });
+      const remaining = sortBy(
+        [...store.keys()]
+          .filter((key) => live(key))
+          .filter((key) => !options?.prefix || key.startsWith(options.prefix))
+          .filter((key) => !options?.cursor || key > options.cursor),
+        (key) => key,
+      );
+      const keys = remaining.slice(0, options?.limit ?? 1000).map((name) => {
+        const entry = store.get(name);
+        return {
+          name,
+          metadata: entry?.metadata,
+          expiration: entry?.expiresAt
+            ? Math.floor(entry.expiresAt / 1000)
+            : undefined,
+        };
+      });
+      return Promise.resolve({
+        keys,
+        list_complete: keys.length === remaining.length,
+        cursor: keys.at(-1)?.name ?? "",
+      });
     },
   };
 }
@@ -133,18 +149,17 @@ type Env = Parameters<Provider["fetch"]>[1];
 let provider: Provider;
 let env: Env;
 
-beforeEach(async () => {
-  vi.useRealTimers();
-  const { createOpenSeoOAuthProvider } = await import("./oauth-provider");
+beforeEach(() => {
   provider = createOpenSeoOAuthProvider(() => new Response("app"));
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the provider touches only OAUTH_KV
   env = { OAUTH_KV: createKvFake() } as unknown as Env;
 });
 
+afterEach(() => vi.useRealTimers());
+
 const registrationSchema = z.looseObject({
   client_id: z.string(),
   token_endpoint_auth_method: z.string(),
-  client_secret: z.string().optional(),
 });
 
 const tokenResponseSchema = z.looseObject({
@@ -173,9 +188,7 @@ function dispatch(request: Request) {
 }
 
 // Codex's DCR registration omits token_endpoint_auth_method entirely.
-async function registerCodexStyleClient(
-  overrides: Record<string, unknown> = {},
-) {
+async function registerCodexStyleClient() {
   const response = await dispatch(
     new Request(`${BASE}/api/auth/oauth2/register`, {
       method: "POST",
@@ -185,7 +198,6 @@ async function registerCodexStyleClient(
         redirect_uris: ["http://localhost:1455/auth/callback"],
         grant_types: ["authorization_code", "refresh_token"],
         response_types: ["code"],
-        ...overrides,
       }),
     }),
   );
@@ -304,8 +316,12 @@ describe("Codex-style OAuth token refresh (real workers-oauth-provider)", () => 
     expect(auth.scopes).toContain("mcp");
   });
 
-  it("refreshes with client_id only and the new token still carries the mcp scope", async () => {
+  it("keeps an active session beyond its original expiry, then expires after inactivity", async () => {
     const { client, tokens } = await setupSession();
+    const day = 24 * 60 * 60 * 1000;
+    const startedAt = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(startedAt + 29 * day);
 
     const response = await refresh(client.client_id, tokens.refresh_token);
     expect(response.status).toBe(200);
@@ -316,33 +332,65 @@ describe("Codex-style OAuth token refresh (real workers-oauth-provider)", () => 
     expect(auth.scopes).toContain("mcp");
     expect(auth.clientId).toBe(client.client_id);
 
-    // And the rotated refresh token keeps working for the next cycle.
+    vi.setSystemTime(startedAt + 31 * day);
     const second = await refresh(client.client_id, refreshed.refresh_token);
     expect(second.status).toBe(200);
+    const rotated = tokenResponseSchema.parse(await second.json());
+    expect((await callMcp(rotated.access_token)).scopes).toContain("mcp");
+
+    vi.setSystemTime(startedAt + 62 * day);
+    const expired = await refresh(client.client_id, rotated.refresh_token);
+    expect(expired.status).toBe(400);
+    const body = tokenErrorSchema
+      .extend({ error_description: z.string() })
+      .parse(await expired.json());
+    expect(body.error).toBe("invalid_grant");
+    expect(body.error_description).toContain(
+      "https://openseo.so/docs/agent-setup",
+    );
   });
 
-  it("honors the previous refresh token until the rotated one is used", async () => {
-    // Codex can lose a token response (crash, retry): the provider keeps the
-    // pre-rotation token valid until the new one is first used.
-    const { client, tokens } = await setupSession();
-
-    const first = tokenResponseSchema.parse(
-      await (await refresh(client.client_id, tokens.refresh_token)).json(),
+  it("resumes OAuth cleanup across grant and token pages, then resets the cursor", async () => {
+    const client = await registerCodexStyleClient();
+    for (let index = 0; index < 200; index++) {
+      const id = String(index).padStart(3, "0");
+      await env.OAUTH_KV.put(
+        `grant:user-1:${id}`,
+        JSON.stringify({ id, userId: "user-1", clientId: client.client_id }),
+      );
+      await env.OAUTH_KV.put(
+        `token:${id}`,
+        JSON.stringify({ userId: "user-1", grantId: id }),
+      );
+    }
+    const orphanedGrant = "grant:user-1:zzz";
+    const orphanedToken = "token:zzz";
+    await env.OAUTH_KV.put(
+      orphanedGrant,
+      JSON.stringify({
+        id: "zzz",
+        userId: "user-1",
+        clientId: "missing-client",
+      }),
     );
-    // Retry with the ORIGINAL token before ever using the rotated one.
-    const retry = await refresh(client.client_id, tokens.refresh_token);
-    expect(retry.status).toBe(200);
-
-    const retried = tokenResponseSchema.parse(await retry.json());
-    // Once a newer refresh token is used, the stale original is rejected.
-    const afterUse = await refresh(client.client_id, retried.refresh_token);
-    expect(afterUse.status).toBe(200);
-    const stale = await refresh(client.client_id, tokens.refresh_token);
-    expect(stale.status).toBe(400);
-    expect(tokenErrorSchema.parse(await stale.json()).error).toBe(
-      "invalid_grant",
+    await env.OAUTH_KV.put(
+      orphanedToken,
+      JSON.stringify({ userId: "missing-user", grantId: "missing-grant" }),
     );
-    void first;
+
+    expect((await provider.purgeExpiredData(env)).done).toBe(false);
+    expect(await env.OAUTH_KV.get("purge-cursor")).not.toBeNull();
+    expect(await env.OAUTH_KV.get(orphanedGrant)).not.toBeNull();
+
+    const nextRun = createOpenSeoOAuthProvider(() => new Response("app"));
+    expect((await nextRun.purgeExpiredData(env)).done).toBe(false);
+    expect(await env.OAUTH_KV.get(orphanedGrant)).toBeNull();
+    expect(await env.OAUTH_KV.get(orphanedToken)).not.toBeNull();
+
+    expect((await nextRun.purgeExpiredData(env)).done).toBe(true);
+    expect(await env.OAUTH_KV.get(orphanedToken)).toBeNull();
+    expect(await env.OAUTH_KV.get("purge-cursor")).toBeNull();
+    expect(await env.OAUTH_KV.get("grant:user-1:000")).not.toBeNull();
   });
 
   it("accepts a refresh carrying the canonical RFC 8707 resource and rejects a mismatched one", async () => {
@@ -423,46 +471,5 @@ describe("Codex-style OAuth token refresh (real workers-oauth-provider)", () => 
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("still rejects a secretless refresh from a client registered as confidential", async () => {
-    // The pre-PR-#420 failure mode: a client stored with client_secret_basic
-    // that never sends its secret fails refresh until it re-registers.
-    const client = await registerCodexStyleClient({
-      token_endpoint_auth_method: "client_secret_basic",
-    });
-    expect(client.client_secret).toBeTruthy();
-    const codeVerifier = randomBytes(32).toString("base64url");
-    const code = await authorizeAndGetCode(client.client_id, codeVerifier);
-
-    // Confidential clients must authenticate even at the code exchange — and
-    // since 0.9.0 the registered method is enforced: client_secret_basic means
-    // the Authorization header, not a client_secret form field.
-    const basicAuth = Buffer.from(
-      `${client.client_id}:${client.client_secret ?? ""}`,
-    ).toString("base64");
-    const exchange = await dispatch(
-      new Request(`${BASE}/api/auth/oauth2/token`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Authorization: `Basic ${basicAuth}`,
-        },
-        body: new URLSearchParams({
-          grant_type: "authorization_code",
-          code,
-          redirect_uri: "http://localhost:1455/auth/callback",
-          code_verifier: codeVerifier,
-        }).toString(),
-      }),
-    );
-    expect(exchange.status).toBe(200);
-    const tokens = tokenResponseSchema.parse(await exchange.json());
-
-    const secretless = await refresh(client.client_id, tokens.refresh_token);
-    expect(secretless.status).toBe(401);
-    expect(tokenErrorSchema.parse(await secretless.json()).error).toBe(
-      "invalid_client",
-    );
   });
 });

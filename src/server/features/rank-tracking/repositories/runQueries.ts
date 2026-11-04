@@ -118,6 +118,65 @@ export async function insertSnapshots(
   );
 }
 
+/** Insert snapshots, replacing the result of any already saved for the pair. */
+export async function upsertSnapshots(
+  snapshots: Array<
+    Omit<InferInsertModel<typeof rankSnapshots>, "id" | "checkedAt">
+  >,
+) {
+  await executeInBatches(snapshots, (tx, snapshot) =>
+    tx
+      .insert(rankSnapshots)
+      .values(snapshot)
+      .onConflictDoUpdate({
+        target: [
+          rankSnapshots.runId,
+          rankSnapshots.trackingKeywordId,
+          rankSnapshots.device,
+        ],
+        set: {
+          position: snapshot.position,
+          url: snapshot.url,
+          serpFeatures: snapshot.serpFeatures,
+        },
+      }),
+  );
+}
+
+/** Replace the ranking URL of saved snapshots. */
+export async function updateSnapshotUrls(
+  updates: Array<{ id: number; url: string }>,
+) {
+  await executeInBatches(updates, (tx, { id, url }) =>
+    tx.update(rankSnapshots).set({ url }).where(eq(rankSnapshots.id, id)),
+  );
+}
+
+/**
+ * Delete "not found" snapshots, matched by run/keyword/device. A row that holds
+ * a position is left alone.
+ */
+export async function deleteNotFoundSnapshots(
+  keys: Array<{
+    runId: string;
+    trackingKeywordId: string;
+    device: "desktop" | "mobile";
+  }>,
+) {
+  await executeInBatches(keys, (tx, key) =>
+    tx
+      .delete(rankSnapshots)
+      .where(
+        and(
+          eq(rankSnapshots.runId, key.runId),
+          eq(rankSnapshots.trackingKeywordId, key.trackingKeywordId),
+          eq(rankSnapshots.device, key.device),
+          isNull(rankSnapshots.position),
+        ),
+      ),
+  );
+}
+
 export async function getSnapshotsForRun(runId: string) {
   return db.select().from(rankSnapshots).where(eq(rankSnapshots.runId, runId));
 }

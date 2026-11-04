@@ -8,9 +8,10 @@ import { projectIdSchema } from "@/server/mcp/schemas";
 import type { SavedKeywordRow, SavedKeywordTagSummary } from "@/types/keywords";
 
 // The app reads the full SavedKeywordRow through its own server functions. The
-// MCP row keeps only what an agent acts on: ids, timestamps, tag colors, and the
-// monthly trend array were ~60% of the bytes and never used.
-const savedKeywordOutputSchema = z.object({
+// MCP row includes the saved row ID for removal, while omitting timestamps,
+// tag colors, and the monthly trend array to keep the response small.
+const savedKeywordOutputSchema = z.looseObject({
+  id: z.string(),
   keyword: z.string(),
   searchVolume: z.number().nullable(),
   keywordDifficulty: z.number().nullable(),
@@ -24,6 +25,7 @@ function toMcpRow(
   row: SavedKeywordRow,
 ): z.infer<typeof savedKeywordOutputSchema> {
   return {
+    id: row.id,
     keyword: row.keyword,
     searchVolume: row.searchVolume,
     keywordDifficulty: row.keywordDifficulty,
@@ -62,14 +64,16 @@ export const listSavedKeywordsTool = {
   config: {
     title: "List saved keywords",
     description:
-      "Lists keywords saved to a project (with cached metrics like search volume, difficulty, CPC, and tags if available). Uses no credits — reads from OpenSEO's database, no DataForSEO call. Use tag filters when the user asks for a saved segment; multiple tags match ANY tag.",
+      "Lists keywords saved to a project (with cached metrics like search volume, difficulty, CPC, and tags if available). Uses no credits — reads from OpenSEO's database, no DataForSEO call. Each row includes its saved-keyword ID for remove_saved_keywords. Use tag filters when the user asks for a saved segment; multiple tags match ANY tag.",
     inputSchema,
-    outputSchema: {
+    outputSchema: z.looseObject({
       rows: z.array(savedKeywordOutputSchema),
       totalCount: z.number(),
-      tags: z.array(z.object({ name: z.string(), keywordCount: z.number() })),
+      tags: z.array(
+        z.looseObject({ name: z.string(), keywordCount: z.number() }),
+      ),
       ...optionalMetaOutputSchema,
-    },
+    }),
     annotations: {
       readOnlyHint: true,
       openWorldHint: false,
@@ -98,7 +102,7 @@ export const listSavedKeywordsTool = {
                   row.tags.length > 0
                     ? `  tags:${row.tags.map((tag) => tag.name).join(",")}`
                     : "";
-                return `- ${row.keyword}  vol:${row.searchVolume ?? "?"}  kd:${row.keywordDifficulty ?? "?"}  cpc:${row.cpc != null ? `$${row.cpc.toFixed(2)}` : "?"}${tagText}`;
+                return `- ${row.keyword}  id:${row.id}  vol:${row.searchVolume ?? "?"}  kd:${row.keywordDifficulty ?? "?"}  cpc:${row.cpc != null ? `$${row.cpc.toFixed(2)}` : "?"}${tagText}`;
               })
               .join("\n");
       return mcpResponse({

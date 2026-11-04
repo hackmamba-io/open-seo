@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { GscNotConnectedError } from "@/server/lib/gscErrors";
 import { makeGa4ReportResult } from "./ga4-test-fixtures";
 import { SearchOpportunityService } from "./SearchOpportunityService";
 
@@ -25,21 +24,6 @@ vi.mock("@/server/features/ga4/services/Ga4ReportingService", () => ({
 }));
 
 const ga4Result = makeGa4ReportResult({
-  status: "ok" as const,
-  source: {
-    provider: "google_analytics" as const,
-    propertyId: "properties/123",
-    propertyDisplayName: "Example",
-  },
-  request: {
-    requestedDateRange: { startDate: "2026-07-07", endDate: "2026-08-03" },
-    resolvedDateRange: { startDate: "2026-07-07", endDate: "2026-08-03" },
-    propertyTimeZone: "America/New_York",
-    currencyCode: "USD",
-    channel: "organic_search" as const,
-    limit: 1_000,
-    offset: 0,
-  },
   rows: [
     {
       hostName: "example.com",
@@ -68,17 +52,6 @@ const ga4Result = makeGa4ReportResult({
   ],
   rowCount: 2,
   totalRowCount: 2,
-  pageInfo: { offset: 0, limit: 1_000, hasMore: false, nextOffset: null },
-  reportMetadata: {
-    dataLossFromOtherRow: false,
-    subjectToThresholding: false,
-    sampling: [],
-    restrictedMetrics: [],
-    emptyReason: null,
-    hasLimitedData: false,
-  },
-  quota: null,
-  warnings: [],
 });
 
 describe("SearchOpportunityService", () => {
@@ -198,6 +171,56 @@ describe("SearchOpportunityService", () => {
     });
   });
 
+  it("does not join GA4 rows without a landing page to the homepage", async () => {
+    mocks.getPerformance.mockResolvedValue({
+      siteUrl: "https://example.com/",
+      request: {},
+      rows: [
+        {
+          keys: ["https://example.com/"],
+          clicks: 1,
+          impressions: 100,
+          ctr: 0.01,
+          position: 10,
+        },
+      ],
+    });
+    mocks.runGa4Report.mockResolvedValue({
+      ...ga4Result,
+      rows: ["", "(not set)"].map((landingPage) => ({
+        ...ga4Result.rows[1],
+        landingPage,
+      })),
+    });
+    const result = await SearchOpportunityService.getOpportunities({
+      projectId: "project_1",
+    });
+    expect(result.rows[0]?.joinStatus).toBe("gsc_only");
+  });
+
+  it("flags a window where GA4 has no organic landing pages at all", async () => {
+    mocks.getPerformance.mockResolvedValue({
+      siteUrl: "https://example.com/",
+      request: {},
+      rows: [
+        {
+          keys: ["https://example.com/other"],
+          clicks: 1,
+          impressions: 100,
+          ctr: 0.01,
+          position: 10,
+        },
+      ],
+    });
+    mocks.runGa4Report.mockResolvedValue(
+      makeGa4ReportResult({ rows: [], rowCount: 0, totalRowCount: 0 }),
+    );
+    const result = await SearchOpportunityService.getOpportunities({
+      projectId: "project_1",
+    });
+    expect(result.warnings).toContain("ga4_no_organic_landing_pages");
+  });
+
   it("anchors the shared default range to the GA4 property date", async () => {
     mocks.getGa4Connection.mockResolvedValue({
       propertyTimeZone: "America/Los_Angeles",
@@ -225,14 +248,5 @@ describe("SearchOpportunityService", () => {
         endDate: "2026-08-02",
       }),
     );
-  });
-
-  it("fails before querying GA4 when Search Console is not connected", async () => {
-    mocks.getGscConnection.mockResolvedValue(null);
-    await expect(
-      SearchOpportunityService.getOpportunities({ projectId: "project_1" }),
-    ).rejects.toBeInstanceOf(GscNotConnectedError);
-    expect(mocks.getPerformance).not.toHaveBeenCalled();
-    expect(mocks.runGa4Report).not.toHaveBeenCalled();
   });
 });

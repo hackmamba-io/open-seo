@@ -1,111 +1,121 @@
-import { useState } from "react";
-import { ArrowLeft, ArrowRight } from "lucide-react";
+import { useEffect, useEffectEvent, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { ArrowRight, Check } from "lucide-react";
+import { AgentList } from "./AgentList";
+import { ONE_CLICK_INSTALLS } from "./agentInstalls";
 import { AgentSetupPanel, AGENT_SETUP_DESCRIPTION } from "./AgentSetupPanel";
 import { getAgentSetupPrompt } from "./agentSetupPrompt";
 import { captureClientEvent } from "@/client/lib/posthog";
+import { WizardFooter } from "@/client/features/onboarding/WizardFooter";
+import { Button } from "@/client/components/ui/button";
+import { getMcpAuthorizedAt } from "@/serverFunctions/onboarding";
 
+/** Last onboarding step. Onboarding finishes when the user clicks Go to
+ *  dashboard, or when their agent connects over MCP (the server marks it). */
 export function AgentSetup({
-  onIntentChange,
-  initialIntent,
-  onComplete,
+  onFinish,
   onBack,
-  disabled = false,
 }: {
-  onIntentChange?: (intent: "yes" | "no") => void;
-  initialIntent?: "yes" | "no" | "";
-  onComplete?: (intent: "yes" | "no") => void;
-  onBack?: () => void;
-  disabled?: boolean;
+  onFinish: () => void;
+  onBack: () => void;
 }) {
-  const [intent, setIntent] = useState(initialIntent ?? "");
-  const prompt = getAgentSetupPrompt(
-    typeof window === "undefined"
-      ? "https://app.openseo.so"
-      : window.location.origin,
-  );
-  const Heading = onComplete ? "h1" : "h2";
-  const chooseIntent = (answer: "yes" | "no") => {
-    if (answer === "yes" || !onComplete) setIntent(answer);
-    onIntentChange?.(answer);
-    captureClientEvent("onboarding:agent_intent", { answer });
-    if (answer === "no") onComplete?.("no");
-  };
+  const prompt = getAgentSetupPrompt(window.location.origin);
+  const [copied, setCopied] = useState(false);
+  // Once the user copies the prompt or opens an agent listing, Go to dashboard
+  // becomes the main button.
+  const [startedSetup, setStartedSetup] = useState(false);
+  // Polls while the tab is visible, so the step moves on within a few seconds
+  // of the user returning from their agent.
+  const { data } = useQuery({
+    queryKey: ["mcpAuthorizedAt"],
+    queryFn: () => getMcpAuthorizedAt(),
+    refetchInterval: 3_000,
+  });
+  const connected = Boolean(data?.authorizedAt);
+
+  // Leave "Connected" on screen briefly before moving on.
+  const finish = useEffectEvent(onFinish);
+  useEffect(() => {
+    if (!connected) return;
+    const timer = setTimeout(finish, 1_500);
+    return () => clearTimeout(timer);
+  }, [connected]);
 
   return (
-    <fieldset disabled={disabled}>
+    <div>
       <div className="mb-8">
-        <Heading className="text-2xl font-semibold tracking-tight">
-          {intent === "yes" ? "Set up your agent" : "Already use an AI agent?"}
-        </Heading>
-        <p className="mt-3 text-pretty text-sm leading-relaxed text-base-content/60">
-          {intent === "yes"
-            ? AGENT_SETUP_DESCRIPTION
-            : "Like Claude, ChatGPT Desktop, or Grok Bot."}
+        <h1 className="text-2xl font-semibold tracking-tight">
+          Set up your agent
+        </h1>
+        <p className="mt-3 text-pretty text-sm leading-relaxed text-muted-foreground">
+          {AGENT_SETUP_DESCRIPTION}
         </p>
+        <AgentList />
       </div>
-      {intent === "yes" ? (
-        <>
-          <AgentSetupPanel
-            prompt={prompt}
-            onCopy={() => captureClientEvent("onboarding:setup_prompt_copy")}
-          />
-          <div className="mt-7 flex items-center justify-between gap-3 border-t border-base-300 pt-5">
-            <button
+      <AgentSetupPanel
+        prompt={prompt}
+        copyVariant={startedSetup ? "outline" : "default"}
+        onCopy={() => {
+          setCopied(true);
+          setStartedSetup(true);
+          captureClientEvent("onboarding:setup_prompt_copy");
+        }}
+        actions={ONE_CLICK_INSTALLS.map(({ agent, name, href, Icon }) => (
+          <Button
+            key={agent}
+            variant="outline"
+            size="lg"
+            className="w-full"
+            nativeButton={false}
+            render={<a href={href} target="_blank" rel="noreferrer" />}
+            onClick={() => {
+              setStartedSetup(true);
+              captureClientEvent("onboarding:add_to_agent_click", { agent });
+            }}
+          >
+            <Icon data-icon="inline-start" />
+            {/* "Add to" drops on narrow screens so both buttons fit one row. */}
+            <span>
+              <span className="max-sm:sr-only">Add to </span>
+              {name}
+            </span>
+          </Button>
+        ))}
+      >
+        {connected ? (
+          <p
+            role="status"
+            className="mt-3 flex items-center justify-center gap-1.5 text-sm font-medium text-success"
+          >
+            <Check className="size-4" aria-hidden />
+            Connected
+          </p>
+        ) : copied ? (
+          <p className="mt-3 text-center text-xs text-muted-foreground">
+            Paste it into your agent and approve the connection.
+          </p>
+        ) : null}
+      </AgentSetupPanel>
+      <div className="mt-7 border-t border-border pt-5">
+        <WizardFooter
+          className="mt-0"
+          onBack={onBack}
+          continueAction={
+            <Button
               type="button"
-              className="flex min-h-10 items-center gap-1.5 text-xs text-base-content/60 hover:text-base-content"
-              onClick={() => setIntent("")}
+              variant={startedSetup ? "default" : "ghost"}
+              className={
+                startedSetup
+                  ? "font-semibold"
+                  : "h-8 gap-2 px-3 text-xs font-semibold"
+              }
+              onClick={onFinish}
             >
-              <ArrowLeft className="size-3.5" /> Back
-            </button>
-            {onComplete && (
-              <button
-                type="button"
-                className="btn btn-ghost btn-sm gap-2"
-                onClick={() => onComplete("yes")}
-              >
-                Go to dashboard <ArrowRight className="size-4" />
-              </button>
-            )}
-          </div>
-        </>
-      ) : (
-        <>
-          <div className="flex items-center justify-between gap-3">
-            {onBack && (
-              <button
-                type="button"
-                className="flex min-h-10 items-center gap-1.5 text-xs text-base-content/60 hover:text-base-content"
-                onClick={onBack}
-              >
-                <ArrowLeft className="size-3.5" /> Back
-              </button>
-            )}
-            <div className="ml-auto flex gap-3">
-              <button
-                type="button"
-                className="btn btn-outline min-w-16"
-                aria-pressed={onComplete ? undefined : intent === "no"}
-                onClick={() => chooseIntent("no")}
-              >
-                No
-              </button>
-              <button
-                type="button"
-                className="btn btn-primary min-w-24"
-                onClick={() => chooseIntent("yes")}
-              >
-                Yes <ArrowRight className="size-4" />
-              </button>
-            </div>
-          </div>
-          {intent === "no" && (
-            <p className="mt-4 text-sm text-base-content/60">
-              You can use the dashboard on its own and connect an agent anytime
-              from Agent setup.
-            </p>
-          )}
-        </>
-      )}
-    </fieldset>
+              Go to dashboard <ArrowRight className="size-4" />
+            </Button>
+          }
+        />
+      </div>
+    </div>
   );
 }

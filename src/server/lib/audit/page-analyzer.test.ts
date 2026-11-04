@@ -9,7 +9,10 @@ import { analyzeHtml } from "@/server/lib/audit/page-analyzer";
 import { normalizeUrl, isSameOrigin } from "@/server/lib/audit/url-utils";
 import type { PageAnalysis, PageLink } from "@/server/lib/audit/types";
 
-/** The previous cheerio implementation, verbatim (minus passthrough fields). */
+/**
+ * The previous cheerio implementation (minus passthrough fields), plus
+ * separators around block elements so minified markup keeps word boundaries.
+ */
 function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
   const $ = cheerio.load(html);
 
@@ -44,6 +47,12 @@ function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
 
   const bodyClone = $("body").clone();
   bodyClone.find("script, style, noscript, svg").remove();
+  bodyClone
+    .find(
+      "address,article,aside,blockquote,br,caption,dd,details,dialog,div,dl,dt,fieldset,figcaption,figure,footer,form,h1,h2,h3,h4,h5,h6,header,hgroup,hr,li,main,nav,ol,p,pre,section,summary,table,td,th,tr,ul",
+    )
+    .before(" ")
+    .after(" ");
   const bodyText = bodyClone.text().replace(/\s+/g, " ").trim();
   const wordCount = bodyText ? bodyText.split(/\s+/).length : 0;
 
@@ -112,7 +121,8 @@ const PAGE_URL = "https://example.com/blog/post";
 function expectParity(html: string) {
   const streamed = analyzeHtml(html, PAGE_URL, 200, 0);
   const reference = analyzeHtmlWithCheerio(html, PAGE_URL);
-  expect(streamed).toEqual(reference);
+  const { javascriptShell: _javascriptShell, ...existingAnalysis } = streamed;
+  expect(existingAnalysis).toEqual(reference);
 }
 
 describe("analyzeHtml parity with the DOM reference", () => {
@@ -207,6 +217,50 @@ describe("analyzeHtml parity with the DOM reference", () => {
   });
 });
 
+describe("analyzeHtml word count", () => {
+  const analyzeBody = (body: string) =>
+    analyzeHtml(`<body>${body}</body>`, PAGE_URL, 200, 0);
+
+  it.each([
+    ["paragraphs", "<p>one</p><p>two</p>"],
+    ["table cells", "<table><tr><td>one</td><td>two</td></tr></table>"],
+    ["line breaks", "one<br>two"],
+  ])("keeps word boundaries between %s in minified HTML", (_label, body) => {
+    expect(analyzeBody(body).bodyText).toBe("one two");
+  });
+
+  it("does not split words across inline markup", () => {
+    expect(analyzeBody("<p>Open<strong>SEO</strong></p>").wordCount).toBe(1);
+  });
+
+  it("counts words in scripts written without spaces", () => {
+    expect(
+      analyzeBody("<p>吉隆坡市中心永久地契公寓投资指南</p>").wordCount,
+    ).toBe(8);
+    expect(analyzeBody("<p>東京の不動産投資ガイド</p>").wordCount).toBe(5);
+    expect(analyzeBody("<p>KLCC 公寓指南 2026</p>").wordCount).toBe(4);
+  });
+});
+
+describe("analyzeHtml meta names are case-insensitive", () => {
+  const analyzeHead = (head: string) =>
+    analyzeHtml(`<head>${head}</head>`, PAGE_URL, 200, 0);
+
+  it("reads the first description regardless of name case", () => {
+    expect(
+      analyzeHead(
+        `<meta name="Description" content="first"><meta name="description" content="second">`,
+      ).metaDescription,
+    ).toBe("first");
+  });
+
+  it("reads robots for name=ROBOTS", () => {
+    expect(
+      analyzeHead(`<meta name="ROBOTS" content="noindex">`).robotsMeta,
+    ).toBe("noindex");
+  });
+});
+
 describe("analyzeHtml extraction caps", () => {
   it("caps links and images per page", () => {
     const links = Array.from(
@@ -226,4 +280,44 @@ describe("analyzeHtml extraction caps", () => {
     expect(analysis.links).toHaveLength(1_000);
     expect(analysis.images).toHaveLength(1_000);
   });
+});
+
+describe("JavaScript app-shell detection", () => {
+  it.each(["root", "app", "__next", "__nuxt"])(
+    "recognizes an empty %s app shell",
+    (id) => {
+      expect(
+        analyzeHtml(
+          `<body><div id="${id}">Loading...</div><script src="/app.js"></script></body>`,
+          PAGE_URL,
+          200,
+          0,
+        ).javascriptShell,
+      ).toBe(true);
+    },
+  );
+  it("recognizes Angular's app element", () => {
+    expect(
+      analyzeHtml(
+        '<app-root></app-root><script type="module" src="/main.js"></script>',
+        PAGE_URL,
+        200,
+        0,
+      ).javascriptShell,
+    ).toBe(true);
+  });
+  it.each([
+    '<div id="root"><h2>A server-rendered heading</h2></div><script src="/app.js"></script>',
+    '<div id="root"><a href="/about">About</a></div><script src="/app.js"></script>',
+    '<div id="app"><img src="/photo.png"></div><script src="/app.js"></script>',
+    '<div id="root"></div><script type="application/ld+json">{}</script>',
+    '<p>Short but valid content</p><script src="/analytics.js"></script>',
+    '<div id="root"></div>',
+    `<div id="root">${"Readable server-rendered content ".repeat(10)}</div><script src="/app.js"></script>`,
+  ])(
+    "does not confuse ordinary HTML, hydrated content, or structured data with a shell",
+    (html) => {
+      expect(analyzeHtml(html, PAGE_URL, 200, 0).javascriptShell).toBe(false);
+    },
+  );
 });

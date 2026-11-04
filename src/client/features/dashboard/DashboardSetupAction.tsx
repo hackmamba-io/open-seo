@@ -1,21 +1,27 @@
 import { useState } from "react";
 import { useForm } from "@tanstack/react-form";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getAgentSetupPrompt } from "@/client/features/ai-mcp/agentSetupPrompt";
-import { CopyButton } from "@/client/features/ai-mcp/SetupControls";
-import { SearchConsoleConnectionCard } from "@/client/features/gsc/SearchConsoleConnectionCard";
+import {
+  AgentSetupPanel,
+  AGENT_SETUP_DESCRIPTION,
+} from "@/client/features/ai-mcp/AgentSetupPanel";
+import { CopyButton } from "@/client/components/CopyButton";
 import { CreateProjectModal } from "@/client/features/projects/CreateProjectModal";
-import { ProjectMarketFields } from "@/client/features/projects/ProjectMarketFields";
-import type { ProjectSummary } from "@/client/features/projects/types";
 import { InviteTeammateModal } from "@/client/features/team/InviteTeammateModal";
+import { PermissionHint } from "@/client/components/PermissionHint";
+import { Button } from "@/client/components/ui/button";
+import { Input } from "@/client/components/ui/input";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/client/components/ui/collapsible";
 import { organizationContextQueryOptions } from "@/client/features/team/organizationQueries";
 import { getStandardErrorMessage } from "@/client/lib/error-messages";
 import { captureClientEvent } from "@/client/lib/posthog";
 import { hasOrgPermission } from "@/lib/org-permissions";
-import { getProjects, setProjectWebsite } from "@/serverFunctions/projects";
-import { markDashboardCompetitorClicked } from "@/serverFunctions/dashboard";
 import type { DashboardSetupStep } from "@/types/schemas/dashboard";
 import { parseResearchTarget } from "@/shared/researchScope";
 
@@ -27,100 +33,95 @@ Replace this list with my websites:
 export function DashboardSetupAction({
   step,
   projectId,
+  domain,
   onComplete,
 }: {
   step: DashboardSetupStep;
   projectId: string;
+  domain: string | null;
   onComplete: () => void;
 }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [showModal, setShowModal] = useState(false);
   const org = useQuery(organizationContextQueryOptions());
-  const projects = useQuery({
-    queryKey: ["projects"],
-    queryFn: () => getProjects(),
-    enabled: step === "domain",
-  });
-  const project = projects.data?.find((item) => item.id === projectId);
-  const competitor = useMutation({
-    mutationFn: () => markDashboardCompetitorClicked({ data: { projectId } }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: ["dashboardActivation", projectId],
-      });
-      onComplete();
-      void navigate({ to: "/p/$projectId/domain", params: { projectId } });
-    },
-    onError: (error) => toast.error(getStandardErrorMessage(error)),
-  });
-  if (step === "domain")
-    return project ? (
-      <WebsiteForm project={project} onComplete={onComplete} />
-    ) : projects.isError ? (
-      <p role="alert" className="text-sm text-error">
-        {getStandardErrorMessage(projects.error)}
-      </p>
-    ) : (
-      <div className="skeleton h-36" aria-busy />
+  // Research steps open the page with the user's input already applied, so
+  // the research runs on arrival and completes the step.
+  if (step === "competitor")
+    return (
+      <StepInputForm
+        description="Explore a competitor’s domain to discover the topics they rank for and the websites linking to them."
+        label="Competitor website"
+        placeholder="competitor.com"
+        submitLabel="Explore competitor"
+        validate={validateDomain}
+        onSubmit={(value) => {
+          onComplete();
+          void navigate({
+            to: "/p/$projectId/domain",
+            params: { projectId },
+            search: { domain: parseDomain(value) },
+          });
+        }}
+      />
+    );
+  if (step === "keywords")
+    return (
+      <StepInputForm
+        description="Start from one keyword that describes what you offer. You’ll get related searches with volume and difficulty."
+        label="Seed keyword"
+        placeholder="e.g. running shoes"
+        submitLabel="Get keyword ideas"
+        validate={(value) =>
+          value.trim() ? undefined : "Enter a keyword to start from"
+        }
+        onSubmit={(value) => {
+          onComplete();
+          void navigate({
+            to: "/p/$projectId/keywords",
+            params: { projectId },
+            search: { q: value.trim() },
+          });
+        }}
+      />
+    );
+  if (step === "audit")
+    return (
+      <StepInputForm
+        description="Crawl your site to find broken links, missing tags, and pages search engines can’t index. You can adjust the crawl size before it starts."
+        label="Site URL"
+        placeholder="https://example.com"
+        defaultValue={domain ? `https://${domain}` : ""}
+        submitLabel="Set up audit"
+        validate={validateDomain}
+        onSubmit={(value) => {
+          onComplete();
+          void navigate({
+            to: "/p/$projectId/audit",
+            params: { projectId },
+            search: { url: value.trim() },
+          });
+        }}
+      />
     );
   if (step === "mcp")
     return (
       <div className="max-w-2xl space-y-4">
-        <p className="text-sm leading-relaxed text-base-content/65">
-          Paste this prompt into your agent to automatically configure OpenSEO
-          for you.
+        <p className="text-sm leading-relaxed text-muted-foreground">
+          {AGENT_SETUP_DESCRIPTION}
         </p>
-        <div className="flex flex-col gap-4 rounded-lg border border-base-300 bg-base-200/25 p-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <p className="text-sm font-medium">OpenSEO plugin</p>
-            <p className="mt-1 text-xs text-base-content/60">
-              MCP connection + SEO skills
-            </p>
-          </div>
-          <div className="shrink-0 [&>button]:h-10 [&>button]:w-full [&>button]:gap-2 [&>button]:text-sm">
-            <CopyButton
-              primary
-              value={getAgentSetupPrompt(
-                typeof window === "undefined"
-                  ? "https://app.openseo.so"
-                  : window.location.origin,
-              )}
-              label="Copy setup prompt"
-              successMessage="Setup prompt copied"
-              onCopy={() =>
-                captureClientEvent("onboarding:setup_prompt_copy", {
-                  source: "dashboard",
-                })
-              }
-            />
-          </div>
-        </div>
-        <a
-          href="https://openseo.so/docs/mcp"
-          target="_blank"
-          rel="noreferrer"
-          className="inline-block text-xs text-base-content/60 underline decoration-base-content/25 underline-offset-4 hover:text-base-content"
-        >
-          Manual setup instructions
-        </a>
-      </div>
-    );
-  if (step === "competitor")
-    return (
-      <div className="space-y-4">
-        <p className="text-sm leading-relaxed text-base-content/65">
-          Explore a competitor’s domain to discover the topics they rank for and
-          the websites linking to them.
-        </p>
-        <button
-          type="button"
-          className="btn btn-primary btn-sm"
-          disabled={competitor.isPending}
-          onClick={() => competitor.mutate()}
-        >
-          Open domain lookup
-        </button>
+        <AgentSetupPanel
+          prompt={getAgentSetupPrompt(
+            typeof window === "undefined"
+              ? "https://app.openseo.so"
+              : window.location.origin,
+          )}
+          onCopy={() =>
+            captureClientEvent("onboarding:setup_prompt_copy", {
+              source: "dashboard",
+            })
+          }
+        />
       </div>
     );
 
@@ -128,60 +129,46 @@ export function DashboardSetupAction({
     org.data &&
     hasOrgPermission(
       org.data.role,
-      step === "project"
-        ? { project: ["create"] }
-        : step === "team"
-          ? { invitation: ["create"] }
-          : { integration: ["manage"] },
+      step === "project" ? { project: ["create"] } : { invitation: ["create"] },
     );
   if (!canManage)
-    return (
-      <p className="text-sm text-base-content/65">
-        {org.isPending
-          ? "Checking workspace permissions…"
-          : org.isError
-            ? getStandardErrorMessage(org.error)
-            : "Ask a workspace owner or admin to help with this step."}
+    return org.isPending ? (
+      <p className="text-sm text-muted-foreground">
+        Checking workspace permissions…
       </p>
-    );
-  if (step === "gsc")
-    return (
-      <SearchConsoleConnectionCard
-        projectId={projectId}
-        returnTo={
-          typeof window === "undefined"
-            ? undefined
-            : `${window.location.href.split("#")[0]}#connect-gsc`
-        }
-      />
+    ) : org.isError ? (
+      <p className="text-sm text-muted-foreground">
+        {getStandardErrorMessage(org.error)}
+      </p>
+    ) : (
+      <PermissionHint action="help with this step" />
     );
   if (step === "project")
     return (
       <div className="space-y-4">
-        <p className="text-sm leading-relaxed text-base-content/65">
+        <p className="text-sm leading-relaxed text-muted-foreground">
           Keep each website’s research, rankings, and connections in its own
           project. Use the project switcher in the sidebar → New project
           anytime.
         </p>
-        <button
-          type="button"
-          className="btn btn-primary btn-sm"
-          onClick={() => setShowModal(true)}
-        >
+        <Button onClick={() => setShowModal(true)}>
           Create another project
-        </button>
-        <details className="rounded-lg border border-base-300 p-4">
-          <summary className="cursor-pointer text-sm font-medium">
+        </Button>
+        <Collapsible className="rounded-lg border border-border p-4">
+          <CollapsibleTrigger className="cursor-pointer text-sm font-medium">
             Have a list of websites? Let your agent set them up.
-          </summary>
-          <div className="mt-3 space-y-3">
-            <p className="text-sm text-base-content/65">
-              <Link to="/ai" className="link">
+          </CollapsibleTrigger>
+          <CollapsibleContent className="mt-3 space-y-3">
+            <p className="text-sm text-muted-foreground">
+              <Link
+                to="/ai"
+                className="text-primary underline-offset-4 hover:underline"
+              >
                 Connect your agent
               </Link>
               , then paste this prompt with your list of websites.
             </p>
-            <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-relaxed text-base-content/65">
+            <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-relaxed text-muted-foreground">
               {projectPrompt}
             </pre>
             <CopyButton
@@ -189,8 +176,8 @@ export function DashboardSetupAction({
               label="Copy project prompt"
               successMessage="Project prompt copied"
             />
-          </div>
-        </details>
+          </CollapsibleContent>
+        </Collapsible>
         {showModal && (
           <CreateProjectModal onClose={() => setShowModal(false)} />
         )}
@@ -198,17 +185,11 @@ export function DashboardSetupAction({
     );
   return (
     <div className="space-y-4">
-      <p className="text-sm leading-relaxed text-base-content/65">
+      <p className="text-sm leading-relaxed text-muted-foreground">
         Bring a teammate into your workspace to share projects, research, and
         results.
       </p>
-      <button
-        type="button"
-        className="btn btn-primary btn-sm"
-        onClick={() => setShowModal(true)}
-      >
-        Invite a teammate
-      </button>
+      <Button onClick={() => setShowModal(true)}>Invite a teammate</Button>
       {showModal && (
         <InviteTeammateModal
           onClose={() => setShowModal(false)}
@@ -226,54 +207,36 @@ export function DashboardSetupAction({
   );
 }
 
-function WebsiteForm({
-  project,
-  onComplete,
+function validateDomain(value: string) {
+  const parsed = parseResearchTarget(value);
+  return parsed.ok ? undefined : parsed.message;
+}
+
+function parseDomain(value: string) {
+  const parsed = parseResearchTarget(value);
+  return parsed.ok ? parsed.target.hostname : value.trim();
+}
+
+function StepInputForm({
+  description,
+  label,
+  placeholder,
+  defaultValue = "",
+  submitLabel,
+  validate,
+  onSubmit,
 }: {
-  project: ProjectSummary;
-  onComplete: () => void;
+  description: string;
+  label: string;
+  placeholder: string;
+  defaultValue?: string;
+  submitLabel: string;
+  validate: (value: string) => string | undefined;
+  onSubmit: (value: string) => void;
 }) {
-  const queryClient = useQueryClient();
-  const save = useMutation({
-    mutationFn: (value: {
-      domain: string;
-      locationCode: number;
-      languageCode: string;
-    }) => setProjectWebsite({ data: { projectId: project.id, ...value } }),
-    onSuccess: async () => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["projects"] }),
-        queryClient.invalidateQueries({
-          queryKey: ["dashboardActivation", project.id],
-        }),
-        queryClient.invalidateQueries({
-          queryKey: ["dashboardOverview", project.id],
-        }),
-        queryClient.invalidateQueries({
-          queryKey: ["projectAccess", project.id],
-        }),
-      ]);
-      toast.success("Website saved");
-      onComplete();
-    },
-    onError: (error) =>
-      toast.error(
-        getStandardErrorMessage(
-          error,
-          "Couldn’t save your website. Try again.",
-        ),
-      ),
-  });
   const form = useForm({
-    defaultValues: {
-      domain: project.domain ?? "",
-      market: {
-        locationCode: project.locationCode,
-        languageCode: project.languageCode,
-      },
-    },
-    onSubmit: ({ value }) =>
-      save.mutate({ domain: value.domain.trim(), ...value.market }),
+    defaultValues: { value: defaultValue },
+    onSubmit: ({ value }) => onSubmit(value.value),
   });
   return (
     <form
@@ -284,60 +247,46 @@ function WebsiteForm({
         void form.handleSubmit();
       }}
     >
-      <p className="text-sm leading-relaxed text-base-content/65">
-        Add the website for this project and choose the country your customers
-        search from. You can change these in project settings anytime.
+      <p className="text-sm leading-relaxed text-muted-foreground">
+        {description}
       </p>
       <form.Field
-        name="domain"
+        name="value"
         validators={{
-          onChange: ({ value }) => {
-            const parsed = parseResearchTarget(value);
-            return parsed.ok ? undefined : parsed.message;
-          },
+          // Stay quiet while the user is still typing; validate on submit, and
+          // keep validating live after the first attempt.
+          onChange: ({ value, fieldApi }) =>
+            fieldApi.form.state.submissionAttempts > 0
+              ? validate(value)
+              : undefined,
         }}
       >
         {(field) => (
           <label className="flex flex-col gap-1.5 text-sm">
-            <span className="font-medium">Website</span>
-            <input
+            <span className="font-medium">{label}</span>
+            <Input
               type="text"
-              required
               maxLength={255}
-              placeholder="example.com"
-              className="input input-bordered w-full"
+              placeholder={placeholder}
               value={field.state.value}
               onBlur={field.handleBlur}
               onChange={(event) => field.handleChange(event.target.value)}
               aria-invalid={field.state.meta.errors.length > 0}
+              className="h-12 px-4 md:text-base"
             />
             {field.state.meta.errors.length > 0 && (
-              <span className="text-xs text-error">
+              <span className="text-xs text-destructive">
                 {field.state.meta.errors.join(", ")}
               </span>
             )}
           </label>
         )}
       </form.Field>
-      <form.Field name="market">
-        {(field) => (
-          <ProjectMarketFields
-            value={field.state.value}
-            onChange={field.handleChange}
-          />
-        )}
-      </form.Field>
-      <form.Subscribe
-        selector={(state) => [state.canSubmit, state.isSubmitting]}
-      >
-        {([canSubmit, isSubmitting]) => (
-          <button
-            type="submit"
-            className="btn btn-primary btn-sm"
-            disabled={!canSubmit || isSubmitting || save.isPending}
-          >
-            {save.isPending ? "Saving…" : "Save website"}
-          </button>
+      <form.Subscribe selector={(state) => state.canSubmit}>
+        {(canSubmit) => (
+          <Button type="submit" size="lg" disabled={!canSubmit}>
+            {submitLabel}
+          </Button>
         )}
       </form.Subscribe>
     </form>

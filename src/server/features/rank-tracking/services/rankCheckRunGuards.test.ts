@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { beginRankCheckRun } from "./rankCheckRunGuards";
 
 const mocks = vi.hoisted(() => ({
@@ -18,19 +18,6 @@ vi.mock(
   "@/server/features/rank-tracking/repositories/RankTrackingRepository",
   () => ({ RankTrackingRepository: mocks }),
 );
-
-const run = {
-  id: "run_1",
-  configId: "config_1",
-  projectId: "project_1",
-  status: "pending" as const,
-  keywordsTotal: 2,
-  keywordsChecked: 0,
-  isSubsetRun: false,
-  errorMessage: null,
-  startedAt: new Date().toISOString(),
-  completedAt: null,
-};
 
 const input = {
   config: {
@@ -55,44 +42,39 @@ const input = {
 };
 
 describe("beginRankCheckRun", () => {
-  beforeEach(() => {});
+  // The workflow enforces the ceiling, so forwarding it (or its absence) is the
+  // billing contract.
+  it.each([undefined, 12])(
+    "starts one workflow with the approved credit ceiling %s",
+    async (maxCostCredits) => {
+      mocks.tryCreateRun.mockResolvedValue(true);
+      const create = vi
+        .fn<(input: { params: { maxCostCredits?: number } }) => Promise<void>>()
+        .mockResolvedValue(undefined);
+      // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- only create is exercised by this unit test
+      const workflow = { create } as unknown as Env["RANK_CHECK_WORKFLOW"];
 
-  it("returns the locally generated run ID without a fallible post-start read", async () => {
-    mocks.tryCreateRun.mockResolvedValue(true);
-    const create = vi
-      .fn<(input: { params: { maxCostCredits?: number } }) => Promise<void>>()
-      .mockResolvedValue(undefined);
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- only create is exercised by this unit test
-    const workflow = { create } as unknown as Env["RANK_CHECK_WORKFLOW"];
+      const result = await beginRankCheckRun({
+        ...input,
+        workflow,
+        maxCostCredits,
+      });
 
-    const result = await beginRankCheckRun({ ...input, workflow });
-    expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error("expected a created run");
-    expect(result.runId).toEqual(expect.any(String));
-    expect(create).toHaveBeenCalledTimes(1);
-    expect(create.mock.calls[0]?.[0].params.maxCostCredits).toBeUndefined();
-    expect(mocks.getRunById).not.toHaveBeenCalled();
-  });
-
-  it("passes the approved credit ceiling into the workflow payload", async () => {
-    mocks.tryCreateRun.mockResolvedValue(true);
-    const create = vi
-      .fn<(input: { params: { maxCostCredits?: number } }) => Promise<void>>()
-      .mockResolvedValue(undefined);
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- only create is exercised by this unit test
-    const workflow = { create } as unknown as Env["RANK_CHECK_WORKFLOW"];
-
-    await beginRankCheckRun({
-      ...input,
-      workflow,
-      maxCostCredits: 12,
-    });
-
-    expect(create.mock.calls[0]?.[0].params.maxCostCredits).toBe(12);
-  });
+      if (!result.ok) throw new Error("expected the run to start");
+      expect(result.runId).toEqual(expect.any(String));
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(create.mock.calls[0]?.[0].params.maxCostCredits).toBe(
+        maxCostCredits,
+      );
+    },
+  );
 
   it("does not create another workflow when a run is already active", async () => {
-    const blocker = { ...run, id: "run_0", status: "running" as const };
+    const blocker = {
+      id: "run_0",
+      status: "running" as const,
+      startedAt: new Date().toISOString(),
+    };
     mocks.tryCreateRun.mockResolvedValue(false);
     mocks.getActiveRunForConfig.mockResolvedValue(blocker);
     mocks.getWorkflow.mockResolvedValue({
@@ -109,5 +91,36 @@ describe("beginRankCheckRun", () => {
     });
     expect(create).not.toHaveBeenCalled();
     expect(mocks.tryCreateRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("terminates a run still active after 12 hours and starts the new one", async () => {
+    const blocker = {
+      id: "run_0",
+      status: "running" as const,
+      startedAt: "2026-01-01T00:00:00.000Z",
+    };
+    mocks.tryCreateRun.mockResolvedValueOnce(false).mockResolvedValue(true);
+    mocks.getActiveRunForConfig.mockResolvedValue(blocker);
+    const terminate = vi.fn();
+    mocks.getWorkflow.mockResolvedValue({
+      status: vi.fn().mockResolvedValue({ status: "running" }),
+      terminate,
+    });
+    const create = vi.fn();
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- only create and get are exercised by this unit test
+    const workflow = {
+      create,
+      get: mocks.getWorkflow,
+    } as unknown as Env["RANK_CHECK_WORKFLOW"];
+
+    const result = await beginRankCheckRun({ ...input, workflow });
+
+    expect(result.ok).toBe(true);
+    expect(terminate).toHaveBeenCalled();
+    expect(mocks.updateRun).toHaveBeenCalledWith(
+      "run_0",
+      expect.objectContaining({ status: "failed" }),
+    );
+    expect(create).toHaveBeenCalledTimes(1);
   });
 });

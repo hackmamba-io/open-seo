@@ -2,10 +2,16 @@ import { createServerFn } from "@tanstack/react-start";
 import { waitUntil } from "cloudflare:workers";
 import { RankTrackingRepository } from "@/server/features/rank-tracking/repositories/RankTrackingRepository";
 import { RankTrackingService } from "@/server/features/rank-tracking/services/RankTrackingService";
+import { RankTrackingKeywordService } from "@/server/features/rank-tracking/services/RankTrackingKeywordService";
 import { getLatestResults } from "@/server/features/rank-tracking/services/rankTrackingResults";
 import { AppError, asAppError } from "@/server/lib/errors";
+import { FeatureFlag, isFeatureFlagOn } from "@/server/lib/featureFlags";
 import { captureServerEvent } from "@/server/lib/posthog";
-import { requireProjectContext } from "@/serverFunctions/middleware";
+import { markOnboardingMilestone } from "@/server/email/onboarding-drip";
+import {
+  requireAuthenticatedContext,
+  requireProjectContext,
+} from "@/serverFunctions/middleware";
 import {
   getConfigsSchema,
   createConfigSchema,
@@ -16,6 +22,7 @@ import {
   estimateCostSchema,
   addKeywordsSchema,
   removeKeywordsSchema,
+  setKeywordsPinnedSchema,
   refreshMetricsSchema,
   getKeywordHistorySchema,
   getConfigTrendSchema,
@@ -35,6 +42,7 @@ interface RankConfigTrendPoint {
   top4to10: number;
   top11to20: number;
   notRanking: number;
+  notChecked: number;
 }
 
 export interface RankPositionMatrixCell {
@@ -42,6 +50,8 @@ export interface RankPositionMatrixCell {
   checkedAt: string;
   trackingKeywordId: string;
   position: number | null;
+  /** False when the keyword was tracked but this run got no result for it. */
+  checked: boolean;
 }
 
 async function requireConfig(configId: string, projectId: string) {
@@ -69,6 +79,10 @@ export const getRankTrackingConfigSummaries = createServerFn({ method: "POST" })
     return RankTrackingRepository.getConfigSummaries(context.projectId);
   });
 
+export const getScheduledRankChecksPaused = createServerFn({ method: "POST" })
+  .middleware(requireAuthenticatedContext)
+  .handler(() => isFeatureFlagOn(FeatureFlag.PauseScheduledRankChecks));
+
 export const createRankTrackingConfig = createServerFn({ method: "POST" })
   .middleware(requireProjectContext)
   .validator(createConfigSchema)
@@ -83,8 +97,18 @@ export const createRankTrackingConfig = createServerFn({ method: "POST" })
       devices: data.devices,
       serpDepth: data.serpDepth,
       scheduleInterval: data.scheduleInterval,
+      scheduleTime: data.scheduleTime,
     });
 
+    // Re-adding an archived domain keeps its keywords, and the keyword step
+    // then adds nothing new — so this is the only place its check can start.
+    await runAutoCheck({
+      configId: result.id,
+      projectId: context.projectId,
+      billingCustomer: context,
+    });
+
+    await markOnboardingMilestone(context, "rankTrackingSetUp");
     waitUntil(
       captureServerEvent({
         distinctId: context.userId,
@@ -92,7 +116,6 @@ export const createRankTrackingConfig = createServerFn({ method: "POST" })
         organizationId: context.organizationId,
         properties: {
           project_id: context.projectId,
-          domain: data.domain,
           devices: data.devices ?? "both",
           schedule: data.scheduleInterval ?? "weekly",
         },
@@ -114,6 +137,7 @@ export const updateRankTrackingConfig = createServerFn({ method: "POST" })
       devices: data.devices,
       serpDepth: data.serpDepth,
       scheduleInterval: data.scheduleInterval,
+      scheduleTime: data.scheduleTime,
       isActive: data.isActive,
     });
     return { success: true };
@@ -184,6 +208,21 @@ function logAutoActionFailure(action: string, err: unknown) {
   }
 }
 
+async function runAutoCheck(
+  input: Parameters<typeof RankTrackingService.triggerAutoCheck>[0],
+) {
+  try {
+    const result = await RankTrackingService.triggerAutoCheck(input);
+    if (!result.ok && result.reason !== "no_keywords") {
+      console.info("[rank-tracking] auto-check skipped: %s", result.reason);
+    }
+    return result;
+  } catch (err) {
+    logAutoActionFailure("auto-check", err);
+    return null;
+  }
+}
+
 export const addTrackingKeywords = createServerFn({ method: "POST" })
   .middleware(requireProjectContext)
   .validator(addKeywordsSchema)
@@ -196,26 +235,15 @@ export const addTrackingKeywords = createServerFn({ method: "POST" })
       data.matchCase,
     );
 
-    let checkTriggered = false;
-    if (result.addedIds.length > 0) {
-      try {
-        const triggerResult = await RankTrackingService.triggerCheck({
-          configId: data.configId,
-          projectId: context.projectId,
-          billingCustomer: context,
-          keywordIds: result.addedIds,
-        });
-        checkTriggered = triggerResult.ok;
-        if (!triggerResult.ok) {
-          console.info(
-            "[rank-tracking] auto-check skipped: %s",
-            triggerResult.reason,
-          );
-        }
-      } catch (err) {
-        logAutoActionFailure("auto-check", err);
-      }
-    }
+    const autoCheck =
+      result.addedIds.length > 0
+        ? await runAutoCheck({
+            configId: data.configId,
+            projectId: context.projectId,
+            billingCustomer: context,
+            keywordIds: result.addedIds,
+          })
+        : null;
 
     // Fetch keyword metrics (awaited so they're in the DB before client re-fetches)
     if (result.added > 0) {
@@ -230,7 +258,12 @@ export const addTrackingKeywords = createServerFn({ method: "POST" })
       }
     }
 
-    return { ...result, checkTriggered };
+    return {
+      ...result,
+      checkTriggered: autoCheck?.ok ?? false,
+      checkScheduledSoon:
+        autoCheck?.ok === false && autoCheck.reason === "scheduled_soon",
+    };
   });
 
 export const removeTrackingKeywords = createServerFn({ method: "POST" })
@@ -241,6 +274,18 @@ export const removeTrackingKeywords = createServerFn({ method: "POST" })
       data.configId,
       context.projectId,
       data.keywordIds,
+    );
+  });
+
+export const setTrackingKeywordsPinned = createServerFn({ method: "POST" })
+  .middleware(requireProjectContext)
+  .validator(setKeywordsPinnedSchema)
+  .handler(async ({ data, context }) => {
+    return RankTrackingKeywordService.setKeywordsPinned(
+      data.configId,
+      context.projectId,
+      data.keywordIds,
+      data.pinned,
     );
   });
 
@@ -293,7 +338,9 @@ export const getRankConfigTrend = createServerFn({ method: "POST" })
       data.sinceDays,
     );
     // SQLite sum()/count() can return strings; coerce and derive "not ranking"
-    // (position > 20 or null) as the remainder so the buckets cover every kw.
+    // (position > 20 or null) as the remainder of the checked keywords, and
+    // "not checked" (the check failed, so no row) as the remainder of the
+    // run's keywords, so the buckets cover every tracked keyword.
     return rows.map((row) => {
       const top3 = Number(row.top3) || 0;
       const top4to10 = Number(row.top4to10) || 0;
@@ -306,6 +353,7 @@ export const getRankConfigTrend = createServerFn({ method: "POST" })
         top4to10,
         top11to20,
         notRanking: Math.max(0, total - top3 - top4to10 - top11to20),
+        notChecked: Math.max(0, row.keywordsTotal - total),
       };
     });
   });

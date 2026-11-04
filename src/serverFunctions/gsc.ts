@@ -3,16 +3,18 @@ import { getRequest } from "@tanstack/react-start/server";
 import { waitUntil } from "cloudflare:workers";
 import { z } from "zod";
 import { GscService } from "@/server/features/gsc/services/GscService";
-import { hasSelfHostedGoogleOAuthConfig } from "@/server/features/google/oauth-config";
+import { hasGoogleOAuthConfig } from "@/server/features/google/oauth-config";
+import { getGoogleAccessMode } from "@/server/features/google/googleAccess";
+import { getGatewayGoogleConnectUrl } from "@/server/features/google/gatewayGoogle";
 import {
-  createSelfHostedGoogleAuthorizationUrl,
+  createGoogleAuthorizationUrl,
   GSC_INTEGRATION,
-} from "@/server/features/google/selfHostedOAuth";
+} from "@/server/features/google/googleOAuth";
 import { hasOrgPermission } from "@/lib/org-permissions";
 import { requireOrgPermission } from "@/server/auth/org-gate";
 import { captureServerEvent } from "@/server/lib/posthog";
+import { markOnboardingMilestone } from "@/server/email/onboarding-drip";
 import { getPublicOrigin } from "@/server/mcp/public-origin";
-import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
 import {
   requireAuthenticatedContext,
   requireProjectContext,
@@ -23,7 +25,7 @@ const setSiteSchema = projectScopedSchema.extend({
   accountId: z.string().min(1),
   siteUrl: z.string().min(1),
 });
-const startSelfHostedLinkSchema = z.object({
+const startLinkSchema = z.object({
   callbackURL: z.string().min(1),
 });
 
@@ -40,18 +42,17 @@ export const getGscConnection = createServerFn({ method: "POST" })
   .middleware(requireProjectContext)
   .validator(projectScopedSchema)
   .handler(async ({ context }) => {
-    const [connection, currentUserHasGrant, hosted, gscConfigured] =
+    const [connection, currentUserHasGrant, googleOAuthConfigured] =
       await Promise.all([
         GscService.getConnection(context.projectId),
         GscService.userHasGrant(context.userId),
-        isHostedServerAuthMode(),
-        hasSelfHostedGoogleOAuthConfig(),
+        hasGoogleOAuthConfig(),
       ]);
     return {
       connected: Boolean(connection),
       canManage: hasOrgPermission(context.role, { integration: ["manage"] }),
       currentUserHasGrant,
-      googleOAuthConfigured: hosted || gscConfigured,
+      googleOAuthConfigured,
       siteUrl: connection?.siteUrl ?? null,
       connectedByEmail: connection?.connectedAccountEmail ?? null,
       connectedAt: connection?.createdAt ?? null,
@@ -79,6 +80,7 @@ export const listGscSites = createServerFn({ method: "POST" })
         email: grant.email,
         requiresReconnect: grant.requiresReconnect,
         propertiesUnavailable: grant.propertiesUnavailable,
+        apiDisabled: grant.apiDisabled,
         sites: grant.sites.map((site) => {
           const isSelected = connection?.gscAccountId
             ? connection.gscAccountId === grant.accountId &&
@@ -108,12 +110,13 @@ export const setGscSite = createServerFn({ method: "POST" })
       siteUrl: data.siteUrl,
       userId: context.userId,
     });
+    await markOnboardingMilestone(context, "gscConnected");
     waitUntil(
       captureServerEvent({
         distinctId: context.userId,
         event: "gsc:property_select",
         organizationId: context.organizationId,
-        properties: { project_id: context.projectId, site_url: data.siteUrl },
+        properties: { project_id: context.projectId },
       }),
     );
     return {
@@ -141,20 +144,20 @@ export const disconnectGsc = createServerFn({ method: "POST" })
     return { connected: false as const };
   });
 
-export const startSelfHostedGscLink = createServerFn({ method: "POST" })
+// Behind the gateway the connect page is the gateway's: one Google
+// connection per member serves Search Console and Analytics alike, and the
+// gateway sends the person back to `callbackURL` afterwards.
+export const startGscLink = createServerFn({ method: "POST" })
   .middleware(requireAuthenticatedContext)
-  .validator(startSelfHostedLinkSchema)
-  .handler(async ({ data, context }) => {
-    const publicOrigin = getPublicOrigin(getRequest());
-    const url = await createSelfHostedGoogleAuthorizationUrl({
-      integration: GSC_INTEGRATION,
-      user: {
-        userId: context.userId,
-        userEmail: context.userEmail,
-      },
-      callbackURL: data.callbackURL,
-      publicOrigin,
-    });
-
-    return { url };
-  });
+  .validator(startLinkSchema)
+  .handler(async ({ data, context }) => ({
+    url:
+      (await getGoogleAccessMode()) === "gateway"
+        ? await getGatewayGoogleConnectUrl(data.callbackURL)
+        : await createGoogleAuthorizationUrl({
+            integration: GSC_INTEGRATION,
+            userId: context.userId,
+            callbackURL: data.callbackURL,
+            publicOrigin: getPublicOrigin(getRequest()),
+          }),
+  }));

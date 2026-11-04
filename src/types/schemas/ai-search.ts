@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { WEB_SEARCH_COUNTRY_CODES } from "@/shared/prompt-search-countries";
 import { researchScopeSchema } from "@/shared/researchScope";
 
 /**
@@ -47,11 +48,13 @@ export const brandLookupInputSchema = z.object({
   // have no URL to scope. Omitted = derive from the query (root → domain, path
   // → subfolder).
   scope: researchScopeSchema.optional(),
-  locationCode: z.number().int().positive().default(2840),
-  languageCode: z.string().min(2).max(8).default("en"),
 });
 
-export type BrandLookupInput = z.infer<typeof brandLookupInputSchema>;
+// The lookup runs in the project's market, which the server function adds.
+export type BrandLookupInput = z.infer<typeof brandLookupInputSchema> & {
+  locationCode: number;
+  languageCode: string;
+};
 
 const brandPlatformBreakdownSchema = z.object({
   platform: z.enum(["chat_gpt", "google"]),
@@ -86,7 +89,7 @@ const brandTopPageSchema = z.object({
   platform: z.enum(["chat_gpt", "google"]),
   // Page-level citation mentions from DataForSEO top_pages.
   mentions: z.number().int().nonnegative().nullable(),
-  // Page-level AI search volume from DataForSEO top_pages.
+  // Page-level AI demand index from DataForSEO top_pages.
   capturedVolume: z.number().int().nonnegative().nullable(),
   // Example prompts from the fetched mentions sample that cited this page.
   keywords: z.array(brandTopPageKeywordSchema).max(50),
@@ -165,47 +168,25 @@ export const PROMPT_EXPLORER_MODELS = [
 export const promptExplorerModelSchema = z.enum(PROMPT_EXPLORER_MODELS);
 export type PromptExplorerModel = z.infer<typeof promptExplorerModelSchema>;
 
-/**
- * Two-letter ISO country code passed as `web_search_country_iso_code` to each
- * LLM Responses endpoint. Affects the web-search component of the answer
- * (Perplexity, GPT-5, Gemini, Claude when web search is on). DataForSEO
- * accepts any ISO-2 for ChatGPT/Gemini; Claude/Perplexity have a finite
- * supported list. We only expose codes covered by all four.
- */
-export const WEB_SEARCH_COUNTRY_CODES = [
-  "US",
-  "GB",
-  "CA",
-  "AU",
-  "IE",
-  "DE",
-  "FR",
-  "ES",
-  "IT",
-  "NL",
-  "PT",
-  "PL",
-  "SE",
-  "NO",
-  "DK",
-  "BR",
-  "MX",
-  "IN",
-  "JP",
-  "KR",
-  "SG",
-  "HK",
-  "TW",
-  "ZA",
-] as const;
-
 export const webSearchCountryCodeSchema = z.enum(WEB_SEARCH_COUNTRY_CODES);
 export type WebSearchCountryCode = z.infer<typeof webSearchCountryCodeSchema>;
+
+export const webSearchCountrySelectionSchema = z.union([
+  webSearchCountryCodeSchema,
+  z.literal("default"),
+]);
+export type WebSearchCountrySelection = z.infer<
+  typeof webSearchCountrySelectionSchema
+>;
 
 export const promptExplorerInputSchema = z.object({
   projectId: z.string().min(1),
   prompt: z.string().trim().min(1).max(PROMPT_EXPLORER_MAX_PROMPT_LENGTH),
-  models: z.array(promptExplorerModelSchema).min(1).max(4),
+  models: z
+    .array(promptExplorerModelSchema)
+    .min(1)
+    .max(4)
+    .default(["chat_gpt"]),
   highlightBrand: z
     .string()
     .trim()
@@ -240,11 +221,12 @@ export const promptExplorerModelResultSchema = z.discriminatedUnion("status", [
     brandMentioned: z.boolean().nullable(),
     outputTokens: z.number().int().nonnegative().nullable(),
     webSearch: z.boolean(),
+    webSearchCountryCode: webSearchCountryCodeSchema.nullable(),
   }),
   z.object({
     status: z.literal("error"),
     model: promptExplorerModelSchema,
-    errorCode: z.literal("UPSTREAM_ERROR"),
+    errorCode: z.enum(["UPSTREAM_ERROR", "UNSUPPORTED_COUNTRY"]),
     message: z.string(),
   }),
 ]);
@@ -299,13 +281,15 @@ export const promptExplorerSearchSchema = z.object({
     .optional()
     .transform((value) =>
       value === undefined ? undefined : Array.isArray(value) ? value : [value],
-    ),
+    )
+    .catch(undefined),
   web: z
     .union([z.boolean(), z.enum(["true", "false"])])
     .optional()
     .transform((value) =>
       value === undefined ? undefined : value === true || value === "true",
-    ),
-  cc: webSearchCountryCodeSchema.optional(),
+    )
+    .catch(undefined),
+  cc: webSearchCountrySelectionSchema.optional().catch("default"),
   hb: z.string().optional(),
 });

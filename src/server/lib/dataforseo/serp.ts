@@ -1,15 +1,20 @@
+/* eslint-disable max-lines -- one file per DataForSEO section (see index.ts); SERP spans live, rank-check and Maps queue calls */
 import { z } from "zod";
+import { isGoogleRedirect } from "@/shared/google-serp-url";
 import { dataforseoGet, dataforseoPost } from "@/server/lib/dataforseo/core";
 import { MAX_TASKS_PER_POST } from "@/server/lib/dataforseo/shared";
 import {
   assertOk,
   buildTaskBilling,
+  DataforseoChargedTaskError,
+  invalidFieldName,
   isNoResultsTask,
   isTaskInProgress,
   parseTaskItems,
   type DataforseoApiResponse,
   type DataforseoItemsTask,
   type DataforseoTaskLike,
+  failedResponseError,
 } from "@/server/lib/dataforseo/envelope";
 import { AppError } from "@/server/lib/errors";
 
@@ -23,7 +28,7 @@ import { AppError } from "@/server/lib/errors";
 export const SERP_ANALYSIS_DEPTH = 20;
 
 /** DataForSEO bills SERPs in pages of 10; depth outside 10-100 is rejected. */
-function clampSerpDepth(depth: number): number {
+export function clampSerpDepth(depth: number): number {
   return Math.min(100, Math.max(10, depth));
 }
 
@@ -79,7 +84,32 @@ const serpSnapshotItemSchema = z
       .nullable()
       .optional(),
   })
-  .passthrough();
+  .passthrough()
+  .transform(unwrapGoogleRedirect);
+
+/**
+ * Google wraps many organic results in a google.com/goto redirect, and
+ * DataForSEO reports them with domain "google.com" and an encoded URL. The
+ * real site is only in the breadcrumb ("https://www.runnersworld.com › gear").
+ * When the breadcrumb isn't a URL (Reddit's "230+ comments") the domain is
+ * unknown, which beats crediting google.com with the result.
+ */
+function unwrapGoogleRedirect<
+  T extends { url?: string | null; breadcrumb?: string | null },
+>(item: T): T & { domain?: string | null } {
+  if (!item.url || !isGoogleRedirect(item.url)) return item;
+  return { ...item, domain: breadcrumbHost(item.breadcrumb) };
+}
+
+function breadcrumbHost(breadcrumb: string | null | undefined): string | null {
+  const first = breadcrumb?.split("›")[0]?.trim();
+  if (!first || !/^https?:\/\//i.test(first)) return null;
+  try {
+    return new URL(first).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return null;
+  }
+}
 
 export type SerpLiveItem = z.infer<typeof serpSnapshotItemSchema>;
 
@@ -88,16 +118,23 @@ export async function fetchLiveSerp(input: {
   locationCode: number;
   languageCode: string;
   depth?: number;
+  /** Canonical DataForSEO name of a city, county, or region for a local SERP. */
+  locationName?: string;
+  device?: "desktop" | "mobile";
 }): Promise<DataforseoApiResponse<SerpLiveItem[]>> {
+  const device = input.device ?? "desktop";
+  const locationParams = input.locationName
+    ? { location_name: input.locationName }
+    : { location_code: input.locationCode };
   const response = await dataforseoPost(
     "/v3/serp/google/organic/live/advanced",
     [
       {
         keyword: input.keyword,
-        location_code: input.locationCode,
+        ...locationParams,
         language_code: input.languageCode,
-        device: "desktop",
-        os: "windows",
+        device,
+        os: device === "desktop" ? "windows" : "android",
         depth: clampSerpDepth(input.depth ?? SERP_ANALYSIS_DEPTH),
       },
     ],
@@ -195,8 +232,8 @@ export async function fetchRankCheckSerp(input: {
 // ---------------------------------------------------------------------------
 // Task-queue rank checks (scheduled runs). DataForSEO's standard queue costs
 // ~30% of the live endpoint; tasks complete in ~5 minutes on average. The flow
-// is task_post (charged) -> poll task_get (free) -> live fallback for
-// stragglers, orchestrated by the rank check workflow.
+// is task_post (charged) -> poll task_get (free), orchestrated by the rank
+// check workflow, which retries stragglers through the queue.
 // ---------------------------------------------------------------------------
 
 export interface RankCheckTaskInput {
@@ -250,10 +287,7 @@ export async function postRankCheckTasks(input: {
   );
 
   if (!response || response.status_code !== 20000) {
-    throw new AppError(
-      "INTERNAL_ERROR",
-      response?.status_message || "DataForSEO task_post failed",
-    );
+    throw failedResponseError(response, "DataForSEO task_post failed");
   }
 
   // One response entry per submitted task; accepted entries have status 20100
@@ -311,10 +345,7 @@ export async function fetchRankCheckTaskResult(input: {
   );
   const task = response?.tasks?.[0];
   if (!response || response.status_code !== 20000 || !task) {
-    throw new AppError(
-      "INTERNAL_ERROR",
-      response?.status_message || "DataForSEO task_get failed",
-    );
+    throw failedResponseError(response, "DataForSEO task_get failed");
   }
 
   if (isTaskInProgress(task)) {
@@ -348,6 +379,8 @@ export async function fetchRankCheckTaskResult(input: {
 export async function fetchLocalSerp(input: {
   keyword: string;
   locationCoordinate?: string;
+  /** A DataForSEO location name, for a search across a whole city. */
+  locationName?: string;
   languageCode: string;
   searchType: "maps" | "local_finder";
   device: "desktop" | "mobile";
@@ -363,6 +396,7 @@ export async function fetchLocalSerp(input: {
       {
         keyword: input.keyword,
         location_coordinate: input.locationCoordinate,
+        location_name: input.locationName,
         language_code: input.languageCode,
         device: input.device,
         os,
@@ -385,6 +419,7 @@ export async function fetchLocalSerp(input: {
     {
       keyword: input.keyword,
       location_coordinate: input.locationCoordinate,
+      location_name: input.locationName,
       language_code: input.languageCode,
       device: input.device,
       os,
@@ -396,4 +431,117 @@ export async function fetchLocalSerp(input: {
     data: task.result?.[0]?.items ?? [],
     billing: buildTaskBilling(task),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Task-queue Maps searches (local rank grids). One task_post carries every
+// grid point, so DataForSEO runs the searches in parallel instead of a Worker
+// request waiting on them six at a time, and at the queue's lower price.
+// Collection through task_get is free.
+// ---------------------------------------------------------------------------
+
+/** High priority finishes in ~10-40 s; the normal queue takes minutes. */
+const LOCAL_TASK_PRIORITY_HIGH = 2;
+
+/**
+ * Posts one Maps task per coordinate and returns the task ids in input
+ * order, null where DataForSEO rejected an entry. Not retried on a 5xx,
+ * which does not prove the post went unbilled.
+ */
+export async function postLocalSerpTasks(input: {
+  keyword: string;
+  locationCoordinates: string[];
+  languageCode: string;
+  device: "desktop" | "mobile";
+  depth: number;
+}): Promise<DataforseoApiResponse<Array<string | null>>> {
+  const response = await dataforseoPost<
+    DataforseoTaskLike & { id?: string; data?: Record<string, unknown> }
+  >(
+    "/v3/serp/google/maps/task_post",
+    input.locationCoordinates.map((coordinate, index) => ({
+      keyword: input.keyword,
+      location_coordinate: coordinate,
+      language_code: input.languageCode,
+      device: input.device,
+      os: input.device === "desktop" ? "windows" : "android",
+      depth: input.depth,
+      search_places: false,
+      priority: LOCAL_TASK_PRIORITY_HIGH,
+      // Echoed back on each entry, so ids map to points without relying on
+      // response order.
+      tag: String(index),
+    })),
+    { maxServerErrorRetries: 0 },
+  );
+  if (!response || response.status_code !== 20000) {
+    throw failedResponseError(response, "DataForSEO task_post failed");
+  }
+
+  // Cost is summed over every entry, accepted or not, so anything DataForSEO
+  // charged is metered.
+  const taskIds: Array<string | null> = input.locationCoordinates.map(
+    () => null,
+  );
+  let costUsd = 0;
+  for (const entry of response.tasks ?? []) {
+    costUsd += entry.cost ?? 0;
+    const index = Number(entry.data?.tag);
+    if (entry.status_code === 20100 && entry.id && taskIds[index] === null) {
+      taskIds[index] = entry.id;
+    } else {
+      console.warn(
+        `dataforseo.task_post.rejected-entry (${entry.status_code}): ${entry.status_message}`,
+      );
+    }
+  }
+  const billing = {
+    path: ["v3", "serp", "google", "maps", "task_post"],
+    costUsd,
+  };
+  if (taskIds.every((id) => id === null)) {
+    // Charged-task error, so the meter still bills whatever DataForSEO
+    // charged, and an uncharged invalid request reads as a validation error.
+    const message =
+      response.tasks?.[0]?.status_message || "DataForSEO created no tasks";
+    throw new DataforseoChargedTaskError(
+      message,
+      billing,
+      invalidFieldName(message) !== null,
+    );
+  }
+  return { data: taskIds, billing };
+}
+
+export type LocalSerpTaskOutcome =
+  | { status: "pending" }
+  | { status: "failed"; message: string }
+  | { status: "completed"; items: Record<string, unknown>[] };
+
+/**
+ * Collects one queued Maps task. Not metered, like fetchRankCheckTaskResult:
+ * the task was charged at task_post.
+ */
+export async function fetchLocalSerpTaskResult(
+  taskId: string,
+): Promise<LocalSerpTaskOutcome> {
+  const response = await dataforseoGet<
+    DataforseoItemsTask<Record<string, unknown>>
+  >(`/v3/serp/google/maps/task_get/advanced/${encodeURIComponent(taskId)}`);
+  const task = response?.tasks?.[0];
+  if (!response || response.status_code !== 20000 || !task) {
+    throw failedResponseError(response, "DataForSEO task_get failed");
+  }
+
+  if (isTaskInProgress(task)) return { status: "pending" };
+  if (task.status_code !== 20000) {
+    // "No Search Results" is a billed empty SERP, as on the live path.
+    if (isNoResultsTask(task)) return { status: "completed", items: [] };
+    return {
+      status: "failed",
+      message:
+        task.status_message || `DataForSEO task failed (${task.status_code})`,
+    };
+  }
+  return { status: "completed", items: task.result?.[0]?.items ?? [] };
 }

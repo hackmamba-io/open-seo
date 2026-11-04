@@ -1,6 +1,4 @@
 import { z } from "zod";
-import { getBrandLookup } from "@/server/features/ai-search/services/brandLookup";
-import { explorePrompt } from "@/server/features/ai-search/services/promptExplorer";
 import { buildProjectMeta } from "@/server/mcp/context";
 import { mcpResponse } from "@/server/mcp/formatters";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
@@ -14,12 +12,9 @@ import { resolveMarket } from "@/shared/keyword-locations";
 import {
   BRAND_LOOKUP_MAX_INPUT_LENGTH,
   brandLookupResultSchema,
-  PROMPT_EXPLORER_MAX_PROMPT_LENGTH,
-  promptExplorerModelSchema,
-  promptExplorerResultSchema,
-  webSearchCountryCodeSchema,
 } from "@/types/schemas/ai-search";
 import { researchScopeSchema } from "@/shared/researchScope";
+import { explorePromptTool } from "@/server/mcp/tools/explore-prompt";
 
 const brandVisibilityInputSchema = {
   projectId: projectIdSchema,
@@ -47,9 +42,47 @@ type BrandVisibilityArgs = z.infer<
   z.ZodObject<typeof brandVisibilityInputSchema>
 >;
 
-const brandVisibilityOutputSchema = brandLookupResultSchema.extend(
-  optionalMetaOutputSchema,
-);
+const brandOutput = brandLookupResultSchema.shape;
+const shareOfVoiceOutput = brandOutput.shareOfVoice.unwrap();
+const topPageOutput = brandOutput.topPages.element;
+const topQueryOutput = brandOutput.topQueries.element;
+
+// MCP clients cache output schemas, so every object must accept new fields.
+const brandVisibilityOutputSchema = brandLookupResultSchema
+  .extend({
+    ...optionalMetaOutputSchema,
+    perPlatform: z.array(brandOutput.perPlatform.element.loose()),
+    shareOfVoice: shareOfVoiceOutput
+      .extend({
+        entries: z.array(shareOfVoiceOutput.shape.entries.element.loose()),
+      })
+      .loose()
+      .nullable(),
+    topPages: z
+      .array(
+        topPageOutput
+          .extend({
+            keywords: z
+              .array(topPageOutput.shape.keywords.element.loose())
+              .max(50),
+          })
+          .loose(),
+      )
+      .max(40),
+    topQueries: z
+      .array(
+        topQueryOutput
+          .extend({
+            citedSources: z
+              .array(topQueryOutput.shape.citedSources.element.loose())
+              .max(10),
+          })
+          .loose(),
+      )
+      .max(50),
+    monthlyVolume: z.array(brandOutput.monthlyVolume.element.loose()),
+  })
+  .loose();
 
 export const getAiBrandVisibilityTool = {
   name: "get_ai_brand_visibility",
@@ -66,6 +99,8 @@ export const getAiBrandVisibilityTool = {
     },
   },
   handler: withMcpProjectAuth(async (args: BrandVisibilityArgs, context) => {
+    const { getBrandLookup } =
+      await import("@/server/features/ai-search/services/brandLookup");
     const { locationCode, languageCode } = resolveMarket(args, context.project);
     const result = await getBrandLookup(
       {
@@ -92,83 +127,11 @@ export const getAiBrandVisibilityTool = {
   }),
 };
 
-const promptExplorerInputSchema = {
-  projectId: projectIdSchema,
-  prompt: z
-    .string()
-    .trim()
-    .min(1)
-    .max(PROMPT_EXPLORER_MAX_PROMPT_LENGTH)
-    .describe("Prompt to run across the selected AI models."),
-  models: z
-    .array(promptExplorerModelSchema)
-    .min(1)
-    .max(4)
-    .describe("One or more of: chat_gpt, claude, gemini, perplexity."),
-  highlightBrand: z
-    .string()
-    .trim()
-    .min(1)
-    .max(BRAND_LOOKUP_MAX_INPUT_LENGTH)
-    .optional()
-    .describe(
-      "Brand or domain to detect in answer text and citations. Omit to skip brand detection.",
-    ),
-  webSearch: z
-    .boolean()
-    .optional()
-    .describe("Allow models to search the web. Defaults to true."),
-  webSearchCountryCode: webSearchCountryCodeSchema
-    .optional()
-    .describe("Optional ISO-2 country used to localize model web search."),
-} as const;
-
-type PromptExplorerArgs = z.infer<
-  z.ZodObject<typeof promptExplorerInputSchema>
->;
-
-const promptExplorerOutputSchema = promptExplorerResultSchema.extend(
-  optionalMetaOutputSchema,
-);
-
+// Keep the fork's existing tool name on the upstream implementation so auth,
+// billing, country selection, and output schemas stay in sync.
 export const exploreAiPromptTool = {
+  ...explorePromptTool,
   name: "explore_ai_prompt",
-  config: {
-    title: "Explore an AI prompt",
-    description:
-      "Run one prompt across selected ChatGPT, Claude, Gemini, and Perplexity models. Returns each model's answer, exact model name, brand presence, citations and URLs, and fan-out queries. Reuses the AI Search prompt explorer and its 7-day per-model cache. Charges credits when not cached.",
-    inputSchema: promptExplorerInputSchema,
-    outputSchema: promptExplorerOutputSchema,
-    annotations: {
-      readOnlyHint: false,
-      openWorldHint: true,
-      destructiveHint: false,
-    },
-  },
-  handler: withMcpProjectAuth(async (args: PromptExplorerArgs, context) => {
-    const result = await explorePrompt(
-      {
-        projectId: args.projectId,
-        prompt: args.prompt,
-        models: args.models,
-        highlightBrand: args.highlightBrand,
-        webSearch: args.webSearch ?? true,
-        webSearchCountryCode: args.webSearchCountryCode,
-      },
-      context.billing,
-    );
-
-    return mcpResponse({
-      text: formatPromptExplorer(result),
-      meta: buildProjectMeta(
-        context,
-        args.projectId,
-        `/p/${args.projectId}/prompt-explorer`,
-        { q: args.prompt },
-      ),
-      structuredContent: result,
-    });
-  }),
 };
 
 function formatBrandVisibility(
@@ -217,38 +180,4 @@ function formatBrandVisibility(
     );
   }
   return lines.join("\n");
-}
-
-function formatPromptExplorer(
-  result: z.infer<typeof promptExplorerResultSchema>,
-): string {
-  const sections = result.results.map((modelResult) => {
-    if (modelResult.status === "error") {
-      return `## ${modelResult.model} — ERROR\n${modelResult.message}`;
-    }
-
-    const citations = modelResult.citations.length
-      ? `\n\nCitations:\n${modelResult.citations
-          .map(
-            (citation) =>
-              `- ${citation.url}${citation.matchedBrand ? " (brand match)" : ""}`,
-          )
-          .join("\n")}`
-      : "";
-    const fanOutQueries = modelResult.fanOutQueries.length
-      ? `\n\nFan-out queries:\n${modelResult.fanOutQueries
-          .map((query) => `- ${query}`)
-          .join("\n")}`
-      : "";
-    return [
-      `## ${modelResult.model}${modelResult.modelName ? ` (${modelResult.modelName})` : ""}`,
-      `Brand mentioned: ${modelResult.brandMentioned ?? "not checked"}`,
-      "",
-      modelResult.text || "(empty answer)",
-      citations,
-      fanOutQueries,
-    ].join("\n");
-  });
-
-  return `Prompt: ${result.prompt}\n\n${sections.join("\n\n")}`;
 }

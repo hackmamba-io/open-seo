@@ -1,8 +1,10 @@
+import { ACCOUNT_DELETION_SCHEDULED_ERROR } from "@/shared/account-deletion";
+
 /**
  * Plain-language copy for Google OAuth failures, shared by the connect-surface
  * inline alert (GoogleLinkErrorAlert) and the /auth-error fallback page.
- * `code` is the `error` query param Better Auth appends on its error
- * redirects.
+ * `code` is the `error` query param on the redirect: Google's own error code
+ * (access_denied), or one set by googleOAuth.ts / Better Auth.
  *
  * `providerLabel` ("Search Console" / "Google Analytics") is set when the
  * failure came from a connect flow; without it the copy reads as a Google
@@ -15,6 +17,12 @@ export function googleAuthErrorCopy(
   const what = providerLabel ? `${providerLabel} connection` : "Google sign-in";
 
   switch (code) {
+    case ACCOUNT_DELETION_SCHEDULED_ERROR:
+      return {
+        title: "This account is being deleted",
+        description:
+          "You asked us to delete this account, so it can't be signed in to. To keep it, email support@openseo.so before the deletion date.",
+      };
     case "state_mismatch":
       return {
         title: `${what} didn't finish`,
@@ -27,12 +35,16 @@ export function googleAuthErrorCopy(
         description:
           "Google's permission screen was closed or declined. Try again whenever you're ready.",
       };
-    case "account_already_linked_to_different_user":
+    case "scope_not_granted":
       return {
-        title: "Google account already connected",
-        description: providerLabel
-          ? `Sign in to the OpenSEO user that linked it, open the ${providerLabel} property picker, and choose Remove account beside the Google account. Then link it here.`
-          : "That Google account is already linked to a different OpenSEO user. Sign in with that user, or contact support for help.",
+        title: `${what} is missing a permission`,
+        description: `OpenSEO didn't get access to your ${providerLabel ?? "Google"} data because a box on Google's permission screen wasn't checked. Try again and check every box before you continue.`,
+      };
+    case "connection_save_failed":
+      return {
+        title: `${what} didn't finish`,
+        description:
+          "We couldn't save the connection. Please try again — if it keeps failing, contact support.",
       };
     default:
       return {

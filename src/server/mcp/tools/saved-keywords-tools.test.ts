@@ -1,8 +1,7 @@
-import { z } from "zod";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { listSavedKeywordsTool } from "./list-saved-keywords";
 import { saveKeywordsTool } from "./save-keywords";
-import { makeToolContext } from "./tool-test-support";
+import { makeToolContext, textContent } from "./tool-test-support";
 
 const mocks = vi.hoisted(() => ({
   getProjectForOrganization: vi.fn(),
@@ -14,12 +13,6 @@ vi.mock("@/server/features/projects/services/ProjectService", () => ({
   ProjectService: {
     getProjectForOrganization: mocks.getProjectForOrganization,
   },
-}));
-
-// project-auth imports the repository for user-scoped (API key) credentials;
-// unused here (pinned context) but keeps the db out of the module graph.
-vi.mock("@/server/auth/repositories/AuthRepository", () => ({
-  AuthRepository: { getMembership: vi.fn() },
 }));
 
 vi.mock("@/server/features/keywords/services/KeywordResearchService", () => ({
@@ -40,37 +33,9 @@ describe("saved keyword MCP tools", () => {
     });
   });
 
-  it("passes tags through save_keywords", async () => {
-    mocks.saveKeywords.mockResolvedValue({
-      success: true,
-      savedKeywordIds: ["saved_1"],
-    });
-
-    const result = await saveKeywordsTool.handler(
-      {
-        projectId: "project_1",
-        keywords: ["technical seo"],
-        tags: ["Content"],
-      },
-      toolContext,
-    );
-
-    expect(mocks.saveKeywords).toHaveBeenCalledWith({
-      projectId: "project_1",
-      keywords: ["technical seo"],
-      tags: ["Content"],
-      tagMode: "append",
-      locationCode: 2840,
-      languageCode: "en",
-    });
-    expect(result.structuredContent).toMatchObject({
-      savedCount: 1,
-      tags: ["Content"],
-      tagMode: "append",
-    });
-  });
-
-  it("accepts and passes keyword metrics through save_keywords", async () => {
+  // Appending is the default: a replace default would silently wipe the
+  // user's existing tags on every save.
+  it("passes tags and metrics through save_keywords, appending tags by default", async () => {
     mocks.saveKeywords.mockResolvedValue({
       success: true,
       savedKeywordIds: ["saved_1"],
@@ -83,58 +48,33 @@ describe("saved keyword MCP tools", () => {
         cpc: 2.5,
         competition: 0.42,
         intent: "commercial" as const,
-        monthlySearches: [
-          { year: 2026, month: 7, searchVolume: 110 },
-          { year: 2026, month: 8, searchVolume: 120 },
-        ],
+        monthlySearches: [{ year: 2026, month: 8, searchVolume: 120 }],
       },
     ];
-    const args = z.object(saveKeywordsTool.config.inputSchema).parse({
-      projectId: "project_1",
-      keywords: ["technical seo"],
-      metrics,
-    });
-
-    await saveKeywordsTool.handler(args, toolContext);
-
-    expect(mocks.saveKeywords).toHaveBeenCalledWith({
-      projectId: "project_1",
-      keywords: ["technical seo"],
-      metrics,
-      tagMode: "append",
-      locationCode: 2840,
-      languageCode: "en",
-    });
-  });
-
-  it("replaces tags through save_keywords when requested", async () => {
-    mocks.saveKeywords.mockResolvedValue({
-      success: true,
-      savedKeywordIds: ["saved_1", "saved_2"],
-    });
 
     const result = await saveKeywordsTool.handler(
       {
         projectId: "project_1",
-        keywords: ["semrush alternative", "semrush pricing"],
-        tags: ["cluster: affordable semrush alternatives"],
-        tagMode: "replace",
+        keywords: ["technical seo"],
+        tags: ["Content"],
+        metrics,
       },
       toolContext,
     );
 
     expect(mocks.saveKeywords).toHaveBeenCalledWith({
       projectId: "project_1",
-      keywords: ["semrush alternative", "semrush pricing"],
-      tags: ["cluster: affordable semrush alternatives"],
-      tagMode: "replace",
+      keywords: ["technical seo"],
+      tags: ["Content"],
+      metrics,
+      tagMode: "append",
       locationCode: 2840,
       languageCode: "en",
     });
     expect(result.structuredContent).toMatchObject({
-      savedCount: 2,
-      tags: ["cluster: affordable semrush alternatives"],
-      tagMode: "replace",
+      savedCount: 1,
+      tags: ["Content"],
+      tagMode: "append",
     });
   });
 
@@ -148,7 +88,10 @@ describe("saved keyword MCP tools", () => {
         },
         toolContext,
       ),
-    ).rejects.toThrow("Replacement tags are required");
+    ).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+      message: "Replacement tags are required when tagMode is replace.",
+    });
     expect(mocks.saveKeywords).not.toHaveBeenCalled();
   });
 
@@ -199,11 +142,8 @@ describe("saved keyword MCP tools", () => {
       rows: [{ keyword: "technical seo", tags: ["Content"] }],
       tags: [{ name: "Content", keywordCount: 1 }],
     });
-    expect(result.structuredContent?.rows?.[0]).not.toHaveProperty("id");
-    const [content] = result.content;
-    expect(content).toMatchObject({ type: "text" });
-    expect(content?.type === "text" ? content.text : "").toContain(
-      "tags:Content",
-    );
+    // remove_saved_keywords takes these ids, so both channels must carry them.
+    expect(result.structuredContent?.rows?.[0]).toHaveProperty("id", "saved_1");
+    expect(textContent(result)).toContain("id:saved_1");
   });
 });

@@ -1,4 +1,5 @@
 import type { AuditResultsData } from "@/client/features/audit/results/types";
+import type { PageFetchClass } from "@/shared/audit-fetch-class";
 
 export type PageRow = AuditResultsData["pages"][number];
 type PerformanceResultRow = AuditResultsData["lighthouse"][number];
@@ -18,6 +19,7 @@ type LighthouseFailureFields = {
 export type PagesFilters = {
   query: string;
   status: "all" | "ok" | "redirect" | "error" | "missing";
+  fetchClass: "all" | PageFetchClass;
   minWords: string;
   maxWords: string;
   minResponseMs: string;
@@ -39,6 +41,7 @@ export type PerformanceFilters = {
 export const EMPTY_PAGES_FILTERS: PagesFilters = {
   query: "",
   status: "all",
+  fetchClass: "all",
   minWords: "",
   maxWords: "",
   minResponseMs: "",
@@ -81,6 +84,9 @@ export function filterPages(rows: PageRow[], filters: PagesFilters) {
       if (!haystack.includes(query)) return false;
     }
     if (!matchesStatus(row.statusCode, filters.status)) return false;
+    if (filters.fetchClass !== "all" && row.fetchClass !== filters.fetchClass) {
+      return false;
+    }
     if (!matchesRange(row.wordCount, filters.minWords, filters.maxWords)) {
       return false;
     }
@@ -162,30 +168,4 @@ function parseFilterNumber(value: string) {
   if (!trimmed) return null;
   const parsed = Number(trimmed);
   return Number.isFinite(parsed) ? parsed : null;
-}
-
-export function nullableNumberSort(
-  left: { getValue: (columnId: string) => number | null },
-  right: { getValue: (columnId: string) => number | null },
-  columnId: string,
-) {
-  const a = left.getValue(columnId);
-  const b = right.getValue(columnId);
-  if (a == null && b == null) return 0;
-  if (a == null) return 1;
-  if (b == null) return -1;
-  return a - b;
-}
-
-export function nullableStringSort(
-  left: { getValue: (columnId: string) => string | null },
-  right: { getValue: (columnId: string) => string | null },
-  columnId: string,
-) {
-  const a = left.getValue(columnId);
-  const b = right.getValue(columnId);
-  if (!a && !b) return 0;
-  if (!a) return 1;
-  if (!b) return -1;
-  return a.localeCompare(b);
 }

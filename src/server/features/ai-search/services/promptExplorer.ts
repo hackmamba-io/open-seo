@@ -1,15 +1,25 @@
 import { waitUntil } from "cloudflare:workers";
 import type { BillingCustomerContext } from "@/server/billing/subscription";
 import { createDataforseoClient } from "@/server/lib/dataforseo";
+import { resolveLatestLlmModelName } from "@/server/lib/dataforseo/llm-models";
 import type { LlmResponseResult } from "@/server/lib/dataforseoLlmSchemas";
 import { AppError } from "@/server/lib/errors";
+import { assertPaidAiSearchPlan } from "./access";
 import {
   AI_SEARCH_PROMPT_CACHE_NAMESPACE,
   buildCacheKey,
   getCached,
   setCached,
 } from "@/server/lib/r2-cache";
-import { safeHostname, safeHttpUrl } from "@/server/features/ai-search/safeUrl";
+import {
+  formatCountryLabel,
+  formatModelLabel,
+} from "@/shared/prompt-explorer-labels";
+import {
+  ignoresWebSearchCountry,
+  supportsWebSearchCountry,
+} from "@/shared/prompt-search-countries";
+import { safeHostname, safeHttpUrl } from "@/shared/safe-url";
 import {
   promptExplorerModelResultSchema,
   type PromptExplorerCitation,
@@ -35,7 +45,7 @@ const PROMPT_RESPONSE_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 /**
  * Hard cap on response length. Set to the DataForSEO per-call maximum because
- * reasoning models (gpt-5, gemini-2.5-pro) count hidden chain-of-thought
+ * reasoning models (gpt-5, gemini) count hidden chain-of-thought
  * tokens against this budget — at 1024 ChatGPT regularly burns the whole
  * budget on reasoning and returns a near-empty visible message.
  */
@@ -47,6 +57,10 @@ export async function explorePrompt(
   input: PromptExplorerInput,
   billingCustomer: BillingCustomerContext,
 ): Promise<PromptExplorerResult> {
+  await assertPaidAiSearchPlan(
+    billingCustomer.organizationId,
+    "Prompt Explorer",
+  );
   const dataforseo = createDataforseoClient(billingCustomer);
   const highlightBrand = input.highlightBrand?.trim() || null;
 
@@ -93,18 +107,35 @@ type RunModelArgs = {
 async function runModel(
   args: RunModelArgs,
 ): Promise<PromptExplorerModelResult> {
+  const country =
+    args.input.webSearch && !ignoresWebSearchCountry(args.model)
+      ? args.input.webSearchCountryCode
+      : undefined;
+  if (country && !supportsWebSearchCountry(args.model, country)) {
+    const modelLabel = formatModelLabel(args.model);
+    return {
+      status: "error",
+      model: args.model,
+      errorCode: "UNSUPPORTED_COUNTRY",
+      message: `${modelLabel} doesn’t support ${formatCountryLabel(country)} as a search country. Select “No country preference” above, then run again to include ${modelLabel}.`,
+    };
+  }
+  // Part of the cache key so a model upgrade refetches rather than serving
+  // cached answers from the previous model.
+  const modelName = await resolveLatestLlmModelName(args.model);
   const cacheKey = await buildCacheKey(AI_SEARCH_PROMPT_CACHE_NAMESPACE, {
     organizationId: args.billingCustomer.organizationId,
     projectId: args.input.projectId,
     model: args.model,
+    modelName,
     // Collapse only whitespace differences. Casing is deliberately preserved:
     // prompts like "Compare Go vs go" or case-sensitive code snippets must
     // not collide with their lowercase twins.
     prompt: normalizePromptForCache(args.input.prompt),
     webSearch: args.input.webSearch,
-    webSearchCountryCode: args.input.webSearchCountryCode ?? null,
+    webSearchCountryCode: country ?? null,
     // Bumped when prompt/payload shape changes — busts stale cache entries.
-    systemPromptV: 5,
+    systemPromptV: 7,
   });
 
   const cached = promptExplorerModelResultSchema.safeParse(
@@ -116,8 +147,30 @@ async function runModel(
     return reapplyHighlightBrand(cached.data, args.highlightBrand);
   }
 
-  const rawResponse = await fetchModelResponse(args);
-  const shaped = shapeSuccess(args.model, rawResponse);
+  let rawResponse = await fetchModelResponse(args, modelName, country);
+  // `web_search: true` only permits searching; models the upstream can't
+  // force (Claude is the only one that accepts `force_web_search` — see
+  // dataforseo/ai.ts) regularly answer from memory and return zero citations
+  // (~40% search rate observed for gpt-5). The browse decision is
+  // non-deterministic per call, so one paid retry meaningfully raises the
+  // odds of a cited answer; keep the retry only if it actually searched.
+  // A failed retry keeps the first answer, which is already paid for.
+  if (args.input.webSearch && !rawResponse.web_search) {
+    const retried = await fetchModelResponse(args, modelName, country).catch(
+      (err) => {
+        console.error(
+          `ai-search.prompt-response.${args.model}.retry failed:`,
+          err,
+        );
+        return null;
+      },
+    );
+    if (retried?.web_search) rawResponse = retried;
+  }
+  const shaped = {
+    ...shapeSuccess(args.model, rawResponse),
+    webSearchCountryCode: country ?? null,
+  };
 
   waitUntil(
     setCached(cacheKey, shaped, PROMPT_RESPONSE_TTL_SECONDS, {
@@ -130,23 +183,17 @@ async function runModel(
   return reapplyHighlightBrand(shaped, args.highlightBrand);
 }
 
-// Each value must be a member of ACCEPTED_LLM_MODEL_NAMES in dataforseo/ai.ts,
-// which mirrors DataForSEO's llm_responses/models catalog. DataForSEO dropped
-// the Claude Sonnet 4.0 family, so we target the 4.5 alias (latest dated 4.5).
-const MODEL_NAMES: Record<PromptExplorerModel, string> = {
-  chat_gpt: "gpt-5",
-  claude: "claude-sonnet-4-5",
-  gemini: "gemini-2.5-pro",
-  perplexity: "sonar-reasoning-pro",
-};
-
-function fetchModelResponse(args: RunModelArgs): Promise<LlmResponseResult> {
+function fetchModelResponse(
+  args: RunModelArgs,
+  modelName: string,
+  country: string | undefined,
+): Promise<LlmResponseResult> {
   return args.dataforseo.aiSearch.llmResponse({
     modelSlug: args.model,
-    modelName: MODEL_NAMES[args.model],
+    modelName,
     userPrompt: args.input.prompt,
     webSearch: args.input.webSearch,
-    webSearchCountryCode: args.input.webSearchCountryCode,
+    webSearchCountryCode: country,
     maxOutputTokens: PROMPT_RESPONSE_MAX_TOKENS,
   });
 }
@@ -178,6 +225,7 @@ function shapeSuccess(
         ? Math.round(response.output_tokens)
         : null,
     webSearch: response.web_search ?? false,
+    webSearchCountryCode: null,
   };
 }
 
@@ -293,10 +341,13 @@ function mapErrorToResult(
   if (
     reason instanceof AppError &&
     (reason.code === "INSUFFICIENT_CREDITS" ||
-      reason.code === "AI_SEARCH_BILLING_ISSUE")
+      reason.code === "AI_SEARCH_BILLING_ISSUE" ||
+      reason.code === "DATAFORSEO_AUTH_FAILED" ||
+      reason.code === "AUTH_CONFIG_MISSING")
   ) {
     // These account-level failures apply to every model, so surface one clear
-    // error instead of silently degrading to per-model failures.
+    // error instead of silently degrading to per-model failures. A gateway
+    // without a DataForSEO key is one: "try again" could never succeed.
     throw reason;
   }
 

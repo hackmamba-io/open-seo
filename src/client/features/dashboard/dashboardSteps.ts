@@ -1,4 +1,11 @@
-import { Bot, FolderPlus, Globe, Search, Users } from "lucide-react";
+import {
+  Bot,
+  ClipboardCheck,
+  FolderPlus,
+  Globe,
+  Lightbulb,
+  Users,
+} from "lucide-react";
 import type { DashboardActivation } from "@/server/features/dashboard/services/DashboardService";
 import type { DashboardSetupStep } from "@/types/schemas/dashboard";
 
@@ -7,12 +14,42 @@ export const setupSteps: {
   label: string;
   detail: string;
   icon: typeof Globe;
+  skipLabel: string;
 }[] = [
   {
-    id: "domain",
-    label: "Add your website",
-    detail: "Set the website and country for this project.",
+    id: "competitor",
+    label: "Explore a competitor",
+    detail: "Find topics and links worth learning from.",
     icon: Globe,
+    skipLabel: "Skip for now",
+  },
+  {
+    id: "keywords",
+    label: "Get keyword ideas",
+    detail: "Start from one keyword and see what people search for.",
+    icon: Lightbulb,
+    skipLabel: "Skip for now",
+  },
+  {
+    id: "audit",
+    label: "Audit your site",
+    detail: "Crawl for broken links, missing tags, and indexability problems.",
+    icon: ClipboardCheck,
+    skipLabel: "Skip for now",
+  },
+  {
+    id: "mcp",
+    label: "Connect your AI agent",
+    detail: "Use OpenSEO inside Claude or your favorite agent.",
+    icon: Bot,
+    skipLabel: "Skip for now",
+  },
+  {
+    id: "team",
+    label: "Invite a teammate",
+    detail: "Share the work, or keep things solo for now.",
+    icon: Users,
+    skipLabel: "Skip",
   },
   {
     id: "project",
@@ -20,30 +57,7 @@ export const setupSteps: {
     detail:
       "Create another project, or let your AI agent set up a list of sites.",
     icon: FolderPlus,
-  },
-  {
-    id: "competitor",
-    label: "Explore a competitor",
-    detail: "Find topics and links worth learning from.",
-    icon: Search,
-  },
-  {
-    id: "mcp",
-    label: "Connect your AI agent",
-    detail: "Use OpenSEO inside Claude or your favorite agent.",
-    icon: Bot,
-  },
-  {
-    id: "gsc",
-    label: "Connect Search Console",
-    detail: "Bring your real clicks and queries into view.",
-    icon: Search,
-  },
-  {
-    id: "team",
-    label: "Invite a teammate",
-    detail: "Share the work, or keep things solo for now.",
-    icon: Users,
+    skipLabel: "I only need one project",
   },
 ];
 
@@ -52,21 +66,19 @@ export function getStepStatus(
   step: DashboardSetupStep,
 ): "done" | "skipped" | "todo" {
   const completed: Record<DashboardSetupStep, boolean> = {
-    domain: activation.domain !== null,
-    project: activation.hasMultipleProjects,
-    competitor: activation.competitorClickedAt !== null,
+    competitor: activation.competitorResearchedAt !== null,
+    keywords: activation.keywordsResearchedAt !== null,
+    audit: activation.hasAudit,
     mcp:
       activation.mcp.authorizedAt !== null ||
       activation.mcp.firstToolCallAt !== null,
-    gsc: activation.gsc.connected,
     team: activation.hasTeammate,
+    project: activation.hasMultipleProjects,
   };
   if (completed[step]) return "done";
-  // Preserve previous MCP dismissals without treating them as authorization.
-  if (
-    activation.dismissedSteps.includes(step) ||
-    (step === "mcp" && activation.mcp.cardDismissedAt !== null)
-  )
-    return "skipped";
-  return "todo";
+  if (!activation.dismissedSteps.includes(step)) return "todo";
+  return completeWhenSkipped.has(step) ? "done" : "skipped";
 }
+
+// Skipping these marks them complete, so they never wait in "saved for later".
+const completeWhenSkipped = new Set<DashboardSetupStep>(["team", "project"]);

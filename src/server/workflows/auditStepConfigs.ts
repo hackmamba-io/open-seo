@@ -9,15 +9,26 @@ import type { WorkflowStepConfig } from "cloudflare:workers";
  * step now has a timeout sized to its real work and a small retry budget.
  */
 
+/** Redirect probe of the start URL: up to 5 hops at 10s each. */
+export const START_URL_STEP: WorkflowStepConfig = {
+  retries: { limit: 2, delay: "5 seconds", backoff: "exponential" },
+  timeout: "2 minutes",
+};
+
 /** Robots + sitemap walk (bounded at 300 docs / 15s per fetch internally). */
 export const DISCOVERY_STEP: WorkflowStepConfig = {
   retries: { limit: 2, delay: "5 seconds", backoff: "exponential" },
   timeout: "4 minutes",
 };
 
-/** One crawl chunk: ~90s soft crawl deadline + persistence headroom. */
+/**
+ * One crawl chunk: ~90s soft crawl deadline + persistence headroom. Workflows
+ * now and then loses an attempt whose code finished (WorkflowInternalError),
+ * and a long audit runs enough chunks to hit two losses in a row, so one
+ * retry is not enough. Chunk writes are idempotent.
+ */
 export const CRAWL_CHUNK_STEP: WorkflowStepConfig = {
-  retries: { limit: 1, delay: "10 seconds", backoff: "constant" },
+  retries: { limit: 3, delay: "10 seconds", backoff: "constant" },
   timeout: "5 minutes",
 };
 
@@ -28,6 +39,15 @@ export const CRAWL_CHUNK_STEP: WorkflowStepConfig = {
 export const LIGHTHOUSE_FETCH_STEP: WorkflowStepConfig = {
   retries: { limit: 0, delay: "1 second" },
   timeout: "5 minutes",
+};
+
+/**
+ * Confirms a rendered audit's credit lock. Finalizing a lock twice is refused,
+ * so a replay must not run it again; a failed settlement expires on its own.
+ */
+export const SETTLE_RENDERING_STEP: WorkflowStepConfig = {
+  retries: { limit: 0, delay: "1 second" },
+  timeout: "1 minute",
 };
 
 /** R2 + DB persistence is idempotent and safe to retry after the paid step. */

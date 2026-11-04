@@ -6,55 +6,39 @@ const fresh: DashboardActivation = {
   domain: null,
   ga4: { connected: false, propertyDisplayName: null, cardDismissedAt: null },
   gsc: { connected: false, siteUrl: null },
-  mcp: { authorizedAt: null, firstToolCallAt: null, cardDismissedAt: null },
-  competitorClickedAt: null,
+  mcp: { authorizedAt: null, firstToolCallAt: null, cardDismissed: false },
+  competitorResearchedAt: null,
+  keywordsResearchedAt: null,
+  hasAudit: false,
   hasMultipleProjects: false,
   hasTeammate: false,
   dismissedSteps: [],
 };
 
 describe("dashboard checklist", () => {
-  it("starts with the website and has no SAM chat step", () => {
-    expect(setupSteps.map((step) => step.id)).toEqual([
-      "domain",
-      "project",
-      "competitor",
-      "mcp",
-      "gsc",
-      "team",
-    ]);
-    expect(
-      setupSteps.every((step) => getStepStatus(fresh, step.id) === "todo"),
-    ).toBe(true);
-  });
-  it("does not count skipped steps as completed", () => {
-    expect(
-      getStepStatus({ ...fresh, dismissedSteps: ["project"] }, "project"),
-    ).toBe("skipped");
-    expect(
-      getStepStatus(
-        { ...fresh, mcp: { ...fresh.mcp, cardDismissedAt: "2026-09-05" } },
-        "mcp",
-      ),
-    ).toBe("skipped");
+  it("saves skipped steps for later, but completes skipped team and project steps", () => {
+    const skipped = {
+      ...fresh,
+      dismissedSteps: ["competitor", "mcp", "team", "project"],
+    };
+    expect(getStepStatus(skipped, "competitor")).toBe("skipped");
+    expect(getStepStatus(skipped, "mcp")).toBe("skipped");
+    expect(getStepStatus(skipped, "team")).toBe("done");
+    expect(getStepStatus(skipped, "project")).toBe("done");
   });
   it("recognizes setup completed elsewhere even after skipping it", () => {
     const complete: DashboardActivation = {
       ...fresh,
-      domain: "example.com",
       hasMultipleProjects: true,
       hasTeammate: true,
-      competitorClickedAt: "2026-09-05",
-      gsc: { connected: true, siteUrl: "sc-domain:example.com" },
+      hasAudit: true,
+      competitorResearchedAt: "2026-09-05",
+      keywordsResearchedAt: "2026-09-05",
       mcp: { ...fresh.mcp, firstToolCallAt: "2026-09-05" },
       dismissedSteps: setupSteps.map((step) => step.id),
     };
     expect(
       setupSteps.every((step) => getStepStatus(complete, step.id) === "done"),
     ).toBe(true);
-  });
-  it("makes disconnected and no-longer-completed steps available again", () => {
-    expect(getStepStatus(fresh, "gsc")).toBe("todo");
-    expect(getStepStatus(fresh, "team")).toBe("todo");
   });
 });

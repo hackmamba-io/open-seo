@@ -1,16 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
+import { usesBetterAuthServer } from "@/server/lib/runtime-env";
 import { formatCount } from "@/shared/format";
 import {
   REPORT_MAX_BYTES_PER_ORG,
   REPORT_MAX_PER_PROJECT,
 } from "@/types/schemas/reports";
-import {
-  deleteReport,
-  getReport,
-  ReportService,
-  saveReport,
-} from "./ReportService";
+import { ReportService } from "./ReportService";
 
 const mocks = vi.hoisted(() => ({
   listReports: vi.fn(),
@@ -29,13 +24,15 @@ vi.mock("@/server/features/reports/repositories/ReportRepository", () => ({
 }));
 vi.mock("@/server/lib/posthog", () => ({ captureServerEvent: vi.fn() }));
 vi.mock("@/server/lib/runtime-env", () => ({
-  isHostedServerAuthMode: vi.fn(),
+  usesBetterAuthServer: vi.fn(),
 }));
 
 const html = "<!doctype html><html><body>Hi</body></html>";
 
-const save = (overrides: Partial<Parameters<typeof saveReport>[0]> = {}) =>
-  saveReport({
+const save = (
+  overrides: Partial<Parameters<typeof ReportService.saveReport>[0]> = {},
+) =>
+  ReportService.saveReport({
     projectId: "project_1",
     organizationId: "org_1",
     title: "badseo.dev SEO audit, Sep 2026",
@@ -102,18 +99,22 @@ describe("saveReport", () => {
     expect(mocks.updateReportContent).not.toHaveBeenCalled();
   });
 
-  it("refuses an over-long title and writes nothing", async () => {
-    await expect(save({ title: "T".repeat(143) })).rejects.toThrow(
+  it.each([
+    [
+      { title: "T".repeat(143) },
       "Title is 143 characters; the limit is 120. Shorten it and save again.",
-    );
-    expect(mocks.insertReport).not.toHaveBeenCalled();
-  });
-
-  it("refuses an over-long summary", async () => {
-    await expect(save({ summary: "s".repeat(2720) })).rejects.toThrow(
+    ],
+    [
+      { summary: "s".repeat(2720) },
       "Summary is 2,720 characters; the limit is 2,500. Shorten it and save again.",
-    );
-  });
+    ],
+  ])(
+    "refuses over-long text and writes nothing: %o",
+    async (input, message) => {
+      await expect(save(input)).rejects.toThrow(message);
+      expect(mocks.insertReport).not.toHaveBeenCalled();
+    },
+  );
 
   it("measures the byte cap in UTF-8, not code units", async () => {
     // 320,000 two-byte characters: under the cap by String.length, over it by
@@ -187,22 +188,13 @@ describe("saveReport", () => {
   });
 });
 
-describe("reads and deletes", () => {
-  it("scopes a read to the project and refuses an unknown id", async () => {
-    mocks.getReport.mockResolvedValue(null);
-
-    await expect(getReport("project_1", "report_gone")).rejects.toThrow(
-      "No report report_gone in this project. Call list_reports to see what exists.",
-    );
-    expect(mocks.getReport).toHaveBeenCalledWith("project_1", "report_gone");
-  });
-
+describe("deleteReport", () => {
   it("refuses a delete whose id is not in this project", async () => {
     mocks.deleteReport.mockResolvedValue(false);
 
-    await expect(deleteReport("project_1", "report_gone")).rejects.toThrow(
-      "No report report_gone in this project.",
-    );
+    await expect(
+      ReportService.deleteReport("project_1", "report_gone"),
+    ).rejects.toThrow("No report report_gone in this project.");
     expect(mocks.deleteReport).toHaveBeenCalledWith("project_1", "report_gone");
   });
 });
@@ -217,7 +209,8 @@ describe("sharing", () => {
     });
 
   beforeEach(() => {
-    vi.mocked(isHostedServerAuthMode).mockResolvedValue(true);
+    mocks.setShareToken.mockResolvedValue(true);
+    vi.mocked(usesBetterAuthServer).mockResolvedValue(true);
     mocks.getReport.mockResolvedValue(storedReport);
   });
 
@@ -272,7 +265,7 @@ describe("sharing", () => {
   // A self-hosted deployment cannot serve the link, so a minted token would be
   // a link that silently does nothing. Refused before the report is even read.
   it("refuses to mint when the deployment is not hosted", async () => {
-    vi.mocked(isHostedServerAuthMode).mockResolvedValue(false);
+    vi.mocked(usesBetterAuthServer).mockResolvedValue(false);
 
     await expect(share()).rejects.toThrow(
       "Sharing is only available on hosted OpenSEO.",

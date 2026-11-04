@@ -1,23 +1,52 @@
+import { env } from "cloudflare:workers";
 import { createServerFn } from "@tanstack/react-start";
+import { APIError } from "better-auth/api";
 import { getRequest } from "@tanstack/react-start/server";
 import { z } from "zod";
 import { getAuth, getHostedBaseUrl } from "@/lib/auth";
+import { isEveryAppAuthMode, isHostedAuthMode } from "@/lib/auth-mode";
 import { hasOrgPermission } from "@/lib/org-permissions";
 import { consumeInvitationSendBudget } from "@/server/auth/invitation-send-limit";
 import { requireOrgPermission } from "@/server/auth/org-gate";
+import { transferOrganizationOwnership } from "@/server/auth/ownership-transfer";
 import { AuthRepository } from "@/server/auth/repositories/AuthRepository";
 import { sendHostedInvitationEmail } from "@/server/email/loops";
 import { AppError } from "@/server/lib/errors";
 import { requireAuthenticatedContext } from "@/serverFunctions/middleware";
+
+/** Teams, invitations and ownership live on the Every App gateway. */
+function refuseBehindEveryAppGateway() {
+  if (isEveryAppAuthMode(env.AUTH_MODE)) throw new AppError("NOT_FOUND");
+}
 
 // The client's source of truth for "who am I in this organization": the active
 // org, the caller's role from their member row (resolved server-side by
 // ensure-user), and every organization they belong to (for the switcher). Used
 // to gate billing/team UI; the server functions and better-auth endpoints
 // re-enforce every permission regardless.
+//
+// Behind an Every App gateway the gateway owns organizations, teams and
+// invitations: the request's signed identity names the one organization and
+// role, member rows are never listed or trusted, and the team functions below
+// refuse (the UI that calls them is hosted-only).
 export const getOrganizationContext = createServerFn({ method: "GET" })
   .middleware(requireAuthenticatedContext)
   .handler(async ({ context }) => {
+    if (isEveryAppAuthMode(env.AUTH_MODE)) {
+      const organizationName = "Organization";
+      return {
+        organizationId: context.organizationId,
+        organizationName,
+        role: context.role,
+        organizations: [
+          {
+            organizationId: context.organizationId,
+            organizationName,
+            role: context.role,
+          },
+        ],
+      };
+    }
     const memberships = await AuthRepository.listMembershipsForUser(
       context.userId,
     );
@@ -40,6 +69,7 @@ export const getOrganizationContext = createServerFn({ method: "GET" })
 export const getTeam = createServerFn({ method: "GET" })
   .middleware(requireAuthenticatedContext)
   .handler(async ({ context }) => {
+    refuseBehindEveryAppGateway();
     const fullOrganization = await getAuth().api.getFullOrganization({
       headers: getRequest().headers,
       query: { organizationId: context.organizationId },
@@ -76,6 +106,7 @@ export const switchOrganization = createServerFn({ method: "POST" })
   .middleware(requireAuthenticatedContext)
   .validator(switchOrganizationSchema)
   .handler(async ({ data, context }) => {
+    refuseBehindEveryAppGateway();
     const membership = await AuthRepository.getMembership(
       context.userId,
       data.organizationId,
@@ -109,6 +140,7 @@ export const sendTeamInvitation = createServerFn({ method: "POST" })
   .middleware(requireAuthenticatedContext)
   .validator(sendInvitationSchema)
   .handler(async ({ data, context }) => {
+    refuseBehindEveryAppGateway();
     // Defense in depth: fail-closed locally before touching the rate-limit
     // budget or calling the plugin, so the budget cannot be exhausted by
     // low-privilege callers.
@@ -116,17 +148,28 @@ export const sendTeamInvitation = createServerFn({ method: "POST" })
 
     await consumeInvitationSendBudget(context.organizationId, data.email);
 
-    const invitation = await getAuth().api.createInvitation({
-      headers: getRequest().headers,
-      body: {
-        email: data.email,
-        role: "admin",
-        resend: true,
-        // Bind the invitation to the request's resolved org, not the session's
-        // active-organization hint, which can be stale after a switch.
-        organizationId: context.organizationId,
-      },
-    });
+    const invitation = await getAuth()
+      .api.createInvitation({
+        headers: getRequest().headers,
+        body: {
+          email: data.email,
+          role: "admin",
+          resend: true,
+          // Bind the invitation to the request's resolved org, not the session's
+          // active-organization hint, which can be stale after a switch.
+          organizationId: context.organizationId,
+        },
+      })
+      .catch((error: unknown) => {
+        // The invite dialog shows this one inline, next to the email.
+        if (
+          error instanceof APIError &&
+          error.body?.code === "USER_IS_ALREADY_A_MEMBER_OF_THIS_ORGANIZATION"
+        ) {
+          throw new AppError("CONFLICT");
+        }
+        throw error;
+      });
 
     const [inviter, memberships] = await Promise.all([
       AuthRepository.getHostedUser(context.userId),
@@ -136,11 +179,17 @@ export const sendTeamInvitation = createServerFn({ method: "POST" })
       memberships.find(
         (membership) => membership.organizationId === context.organizationId,
       )?.organizationName ?? "Organization";
+    const inviteUrl = `${getHostedBaseUrl()}/accept-invitation/${invitation.id}`;
+
+    // Password mode has no email transport: the inviter passes the link on.
+    if (!isHostedAuthMode(env.AUTH_MODE)) {
+      return { invitationId: invitation.id, inviteUrl };
+    }
 
     try {
       await sendHostedInvitationEmail({
         email: data.email,
-        inviteUrl: `${getHostedBaseUrl()}/accept-invitation/${invitation.id}`,
+        inviteUrl,
         organizationName,
         inviterName: inviter?.name?.trim() || context.userEmail,
         inviterEmail: context.userEmail,
@@ -152,5 +201,19 @@ export const sendTeamInvitation = createServerFn({ method: "POST" })
       throw new AppError("UPSTREAM_UNAVAILABLE");
     }
 
-    return { invitationId: invitation.id };
+    return { invitationId: invitation.id, inviteUrl: undefined };
+  });
+
+const transferOwnershipSchema = z.object({ memberId: z.string().min(1) });
+
+// Owner-only. Runs here rather than through better-auth's update-member-role,
+// which can't swap two roles atomically and refuses owner grants (see the
+// beforeUpdateMemberRole hook in auth.ts).
+export const transferOwnership = createServerFn({ method: "POST" })
+  .middleware(requireAuthenticatedContext)
+  .validator(transferOwnershipSchema)
+  .handler(async ({ data, context }) => {
+    refuseBehindEveryAppGateway();
+    await transferOrganizationOwnership(context, data.memberId);
+    return { memberId: data.memberId };
   });

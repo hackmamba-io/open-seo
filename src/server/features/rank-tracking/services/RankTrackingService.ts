@@ -12,6 +12,7 @@ import { assertSerpLocationNameAccepted } from "@/server/lib/dataforseo/serp-loc
 import { AppError } from "@/server/lib/errors";
 import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
 import type {
+  RankCheckScheduleTime,
   RankTrackingConfig,
   RankCheckTriggerResult,
 } from "@/types/schemas/rank-tracking";
@@ -21,18 +22,17 @@ import {
 } from "./rankCheckRunGuards";
 import {
   estimateRankCheckCredits,
-  computeNextCheckAt,
-  isScheduledRankTrackingInterval,
   MAX_CONFIGS_PER_PROJECT,
   rankCheckCostApprovalError,
 } from "@/shared/rank-tracking";
+import { resolveNextCheckAt } from "./configSchedule";
 import {
   getIsoCountryCode,
   resolveKeywordDataLanguage,
   resolveMarket,
 } from "@/shared/keyword-locations";
 import { getLatestResults } from "./rankTrackingResults";
-import { toSqliteTimestamp } from "@/server/features/rank-tracking/rankTrackingTimestamps";
+import { toRankTrackingTimestamp } from "@/server/features/rank-tracking/rankTrackingTimestamps";
 import { RankTrackingKeywordService } from "./RankTrackingKeywordService";
 
 // ---------------------------------------------------------------------------
@@ -49,6 +49,7 @@ async function createConfig(input: {
   devices?: RankTrackingConfig["devices"];
   serpDepth: number;
   scheduleInterval?: RankTrackingConfig["scheduleInterval"];
+  scheduleTime?: RankCheckScheduleTime;
 }) {
   const normalizedDomain = normalizeDomain(input.domain);
 
@@ -57,9 +58,7 @@ async function createConfig(input: {
     input.projectMarket,
   );
   const scheduleInterval = input.scheduleInterval ?? "weekly";
-  const nextCheckAt = isScheduledRankTrackingInterval(scheduleInterval)
-    ? computeNextCheckAt(scheduleInterval)
-    : null;
+  const nextCheckAt = resolveNextCheckAt(scheduleInterval, input.scheduleTime);
 
   const locationName = input.locationName ?? null;
   // Before the duplicate/limit checks so an unusable location name is the
@@ -72,14 +71,14 @@ async function createConfig(input: {
     });
   }
 
-  const existing =
-    await RankTrackingRepository.getConfigByProjectDomainLocation(
-      input.projectId,
-      normalizedDomain,
-      locationCode,
-      locationName,
-    );
-  // The (project, domain, location) row still exists when a domain is
+  const existing = await RankTrackingRepository.getConfigByProjectDomainMarket(
+    input.projectId,
+    normalizedDomain,
+    locationCode,
+    languageCode,
+    locationName,
+  );
+  // The (project, domain, location, language) row still exists when a domain is
   // archived — archiving only flips isActive to false. So re-adding an
   // archived domain reactivates that row (keeping its keyword/ranking
   // history) with the freshly chosen settings, rather than colliding with
@@ -88,8 +87,8 @@ async function createConfig(input: {
     throw new AppError(
       "VALIDATION_ERROR",
       locationName
-        ? "This domain + city combination is already being tracked"
-        : "This domain + country combination is already being tracked",
+        ? "This domain + city + language combination is already being tracked"
+        : "This domain + country + language combination is already being tracked",
     );
   }
 
@@ -108,7 +107,6 @@ async function createConfig(input: {
   if (existing) {
     await RankTrackingRepository.updateConfig(existing.id, input.projectId, {
       isActive: true,
-      languageCode,
       devices: input.devices ?? "both",
       serpDepth: input.serpDepth,
       scheduleInterval,
@@ -136,7 +134,7 @@ async function createConfig(input: {
     isActive: true,
     lastCheckedAt: null,
     lastSkipReason: null,
-    createdAt: toSqliteTimestamp(new Date()),
+    createdAt: toRankTrackingTimestamp(new Date()),
   };
 
   await RankTrackingRepository.createConfig(config);
@@ -155,10 +153,13 @@ async function updateConfig(
     devices?: RankTrackingConfig["devices"];
     serpDepth?: number;
     scheduleInterval?: RankTrackingConfig["scheduleInterval"];
+    scheduleTime?: RankCheckScheduleTime;
     isActive?: boolean;
   },
 ) {
-  const updates: typeof input & { nextCheckAt?: string | null } = {};
+  const { scheduleTime, ...fields } = input;
+  const updates: typeof fields & { nextCheckAt?: string | null } = {};
+  const existing = await getValidatedConfig(configId, projectId);
 
   // A location name is only valid together with its market, so re-check the
   // resulting (name, language, country) whenever any of the three changes.
@@ -167,7 +168,6 @@ async function updateConfig(
     input.locationCode !== undefined ||
     input.languageCode !== undefined;
   if (marketChanged) {
-    const existing = await getValidatedConfig(configId, projectId);
     const locationName =
       input.locationName === undefined
         ? existing.locationName
@@ -195,13 +195,17 @@ async function updateConfig(
   if (input.serpDepth !== undefined) updates.serpDepth = input.serpDepth;
   if (input.isActive !== undefined) updates.isActive = input.isActive;
 
-  if (input.scheduleInterval !== undefined) {
-    updates.scheduleInterval = input.scheduleInterval;
-    if (input.scheduleInterval === "manual") {
-      updates.nextCheckAt = null;
-    } else {
-      updates.nextCheckAt = computeNextCheckAt(input.scheduleInterval);
-    }
+  const scheduleInterval = input.scheduleInterval ?? existing.scheduleInterval;
+  // The config modal resends the interval on every save, so only move the
+  // anchor when the schedule really changed — otherwise editing, say, devices
+  // would re-randomize the run time.
+  if (
+    scheduleTime ||
+    scheduleInterval !== existing.scheduleInterval ||
+    (scheduleInterval !== "manual" && !existing.nextCheckAt)
+  ) {
+    updates.scheduleInterval = scheduleInterval;
+    updates.nextCheckAt = resolveNextCheckAt(scheduleInterval, scheduleTime);
   }
 
   await RankTrackingRepository.updateConfig(configId, projectId, updates);
@@ -232,7 +236,7 @@ async function triggerCheck(input: {
 
   if (input.maxCostCredits != null) {
     const { costCredits } = estimateRankCheckCredits(
-      keywords.length,
+      keywords.map((kw) => kw.keyword),
       config.devices,
       config.serpDepth,
       "live",
@@ -261,6 +265,39 @@ async function triggerCheck(input: {
     trigger: "manual",
     workflowStartErrorMessage: "Failed to start rank check workflow",
   });
+}
+
+// A scheduled check this close covers the same keywords, so an automatic
+// check now would bill the customer twice within the hour.
+const AUTO_CHECK_SCHEDULE_WINDOW_MS = 60 * 60_000;
+
+// The check that follows adding a domain or keywords, as opposed to the user
+// pressing "Check Now" — so it yields to an imminent scheduled check.
+async function triggerAutoCheck(input: {
+  configId: string;
+  projectId: string;
+  billingCustomer: BillingCustomerContext;
+  keywordIds?: string[];
+}): Promise<
+  | RankCheckTriggerResult
+  | { ok: false; reason: "scheduled_soon" | "no_keywords" }
+> {
+  const config = await getValidatedConfig(input.configId, input.projectId);
+  const msUntilScheduled = config.nextCheckAt
+    ? new Date(config.nextCheckAt).getTime() - Date.now()
+    : Infinity;
+  if (msUntilScheduled <= AUTO_CHECK_SCHEDULE_WINDOW_MS) {
+    // A free plan must not be told to wait for a scheduled check that the
+    // scheduler will skip. The other path checks access in triggerCheck.
+    await requireRankCheckAccess(input.billingCustomer.organizationId);
+    return { ok: false, reason: "scheduled_soon" };
+  }
+  // A brand-new domain has no keywords yet; a re-added archived one keeps its.
+  const counts = await RankTrackingRepository.getKeywordCountsForConfigs([
+    config.id,
+  ]);
+  if (!counts.get(config.id)) return { ok: false, reason: "no_keywords" };
+  return triggerCheck(input);
 }
 
 async function getLatestRun(configId: string, projectId: string) {
@@ -299,12 +336,13 @@ async function refreshKeywordMetrics(
   if (keywords.length === 0) return { updated: 0 };
 
   const client = createDataforseoClient(billingCustomer);
+  const lower = (text: string) => text.toLocaleLowerCase(config.languageCode);
   const metrics = await fetchKeywordMetricsForList(client, {
     // The keyword-data APIs are case-insensitive and echo keywords back
     // lowercased, so ask in lowercase. A match-case keyword can sit next to
     // its lowercase twin; both then map to the same metrics row and the
     // request carries no duplicates.
-    keywords: [...new Set(keywords.map((kw) => kw.keyword.toLowerCase()))],
+    keywords: [...new Set(keywords.map((kw) => lower(kw.keyword)))],
     locationCode: config.locationCode,
     // Trackers can pair any SERP language with any country; the keyword-data
     // APIs only serve the country's own languages.
@@ -318,13 +356,13 @@ async function refreshKeywordMetrics(
     creditFeature: "rank_tracking",
   });
   const byKeyword = new Map(
-    metrics.map((metric) => [metric.keyword.toLowerCase(), metric]),
+    metrics.map((metric) => [lower(metric.keyword), metric]),
   );
 
   const now = new Date().toISOString();
   const updates = keywords
     .map((kw) => {
-      const metric = byKeyword.get(kw.keyword.toLowerCase());
+      const metric = byKeyword.get(lower(kw.keyword));
       if (!metric) return null;
       // Rank tracking only tracks volume / difficulty / CPC.
       return {
@@ -354,6 +392,39 @@ async function getTracker(configId: string, projectId: string) {
   const config = await getValidatedConfig(configId, projectId);
   const results = await getLatestResults(configId, projectId);
   return { config, results };
+}
+
+/**
+ * Position history for one device over a tracker's last `runLimit` completed
+ * full runs, plus the keywords it currently tracks so callers can name rows.
+ */
+async function getPositionHistory(input: {
+  configId: string;
+  projectId: string;
+  /** Defaults to desktop, or mobile for a mobile-only tracker. */
+  device?: "desktop" | "mobile";
+  runLimit: number;
+}) {
+  // The project-scoped config lookup is the authorization gate for the
+  // configId-keyed reads, so it runs first.
+  const config = await getValidatedConfig(input.configId, input.projectId);
+  const device =
+    input.device ?? (config.devices === "mobile" ? "mobile" : "desktop");
+  if (config.devices !== "both" && config.devices !== device) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      `This tracker only checks ${config.devices}.`,
+    );
+  }
+  const [keywords, cells] = await Promise.all([
+    RankTrackingRepository.getKeywordsForConfig(input.configId),
+    RankTrackingRepository.getPositionMatrix(
+      input.configId,
+      device,
+      input.runLimit,
+    ),
+  ]);
+  return { config, device, keywords, cells };
 }
 
 async function requireRankCheckAccess(organizationId: string) {
@@ -424,10 +495,12 @@ export const RankTrackingService = {
   addKeywords: RankTrackingKeywordService.addKeywords,
   removeKeywords: RankTrackingKeywordService.removeKeywords,
   triggerCheck,
+  triggerAutoCheck,
   getLatestRun,
   estimateCost: RankTrackingKeywordService.estimateCost,
   refreshKeywordMetrics,
   getConfigs,
   getTracker,
+  getPositionHistory,
   requireRankCheckAccess,
 };

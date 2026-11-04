@@ -2,7 +2,6 @@ import {
   archiveProject,
   createProject,
   getProjectForOrganization,
-  getProjectWithOrganization,
   listArchivedProjects,
   listProjects,
   listProjectsEnsuringOne,
@@ -10,6 +9,7 @@ import {
   setProjectWebsite,
   updateProject,
 } from "@/server/features/projects/services/projects";
+import { deleteArchivedProject } from "@/server/features/projects/services/deleteProject";
 
 export const ProjectService = {
   listProjects,
@@ -19,7 +19,7 @@ export const ProjectService = {
   setProjectWebsite,
   archiveProject,
   restoreProject,
+  deleteArchivedProject,
   listArchivedProjects,
   getProjectForOrganization,
-  getProjectWithOrganization,
 } as const;

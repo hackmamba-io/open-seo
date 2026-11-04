@@ -36,23 +36,41 @@ describe("resolveSignInHostedOrganization", () => {
   // must NOT get a personal organization auto-minted at sign-in — accepting the
   // invite should leave them in exactly the inviter's org.
   it("defers organization creation while an invitation is pending", async () => {
-    mocks.hasPendingInvitationForEmail.mockResolvedValue(true);
-    const createOrganization = vi.fn();
+    const createOrganization = vi.fn().mockResolvedValue({ id: "org-new" });
 
+    mocks.hasPendingInvitationForEmail.mockResolvedValue(true);
     await expect(
       resolveSignInHostedOrganization("user-1", createOrganization),
     ).resolves.toBeNull();
-
     expect(createOrganization).not.toHaveBeenCalled();
-  });
 
-  it("creates the default organization when no invitation is pending", async () => {
     mocks.hasPendingInvitationForEmail.mockResolvedValue(false);
-    const createOrganization = vi.fn().mockResolvedValue({ id: "org-new" });
-
     await expect(
       resolveSignInHostedOrganization("user-1", createOrganization),
     ).resolves.toMatchObject({ organizationId: "org-new" });
+  });
+
+  // Billing invariant: each default org is a new billing customer with a
+  // free-plan grant, and the unique slug is what stops a second one. A user
+  // who left their org and renamed themselves must still collide.
+  it("keys the default organization slug on the user, not their name", async () => {
+    mocks.hasPendingInvitationForEmail.mockResolvedValue(false);
+    const createOrganization = vi.fn(async (_input: { slug: string }) => ({
+      id: "org-new",
+    }));
+
+    await resolveSignInHostedOrganization("user-1", createOrganization);
+    mocks.getHostedUser.mockResolvedValue({
+      id: "user-1",
+      email: "invitee@example.com",
+      name: "Renamed",
+    });
+    await resolveSignInHostedOrganization("user-1", createOrganization);
+
+    const [first, second] = createOrganization.mock.calls.map(
+      ([input]) => input.slug,
+    );
+    expect(second).toBe(first);
   });
 
   // An existing membership always wins — the pending-invite check only

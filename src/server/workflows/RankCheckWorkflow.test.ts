@@ -1,9 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkflowStep } from "cloudflare:workers";
-import {
-  prepareRankCheckKeywords,
-  RankCheckWorkflow,
-} from "./RankCheckWorkflow";
+import { RankCheckWorkflow } from "./RankCheckWorkflow";
 
 const mocks = vi.hoisted(() => ({
   getConfigById: vi.fn(),
@@ -12,6 +9,8 @@ const mocks = vi.hoisted(() => ({
   updateRun: vi.fn(),
   updateConfig: vi.fn(),
   getSnapshotsForRun: vi.fn(),
+  updateSnapshotUrls: vi.fn(),
+  resolveGotoUrls: vi.fn(),
   autumnCheck: vi.fn(),
   createDataforseoClient: vi.fn(),
   runLiveCheck: vi.fn(),
@@ -37,17 +36,30 @@ vi.mock("@/server/features/rank-tracking/services/rankCheckRunGuards", () => ({
 vi.mock("@/server/workflows/rankCheckPaths", () => ({
   runLiveCheck: mocks.runLiveCheck,
   runQueuedCheck: vi.fn(),
+  retryRankChecks: vi.fn(),
 }));
 vi.mock("@/server/workflows/pgStep", () => ({
-  pgStep: (
+  // Like the engine, run() gets a rebuilt Error, never the thrown object.
+  pgStep: async (
     _step: unknown,
     _name: string,
     _config: unknown,
     fn: () => unknown,
-  ) => fn(),
+  ) => {
+    try {
+      return await fn();
+    } catch (error) {
+      throw new Error(
+        error instanceof Error ? `${error.name}: ${error.message}` : "",
+        { cause: error },
+      );
+    }
+  },
 }));
 vi.mock("@/server/lib/dataforseo", () => ({
   createDataforseoClient: mocks.createDataforseoClient,
+  MAX_GOTO_URLS_PER_REQUEST: 2,
+  resolveGotoUrls: mocks.resolveGotoUrls,
 }));
 vi.mock("@/server/lib/posthog", () => ({
   captureServerEvent: mocks.captureServerEvent,
@@ -57,6 +69,9 @@ vi.mock("@/server/billing/autumn", () => ({
 }));
 vi.mock("@/server/lib/runtime-env", () => ({
   isHostedServerAuthMode: mocks.isHostedServerAuthMode,
+}));
+vi.mock("@/server/email/onboarding-drip", () => ({
+  sendCreditsExhaustedEvent: vi.fn(),
 }));
 
 const billingCustomer = {
@@ -71,96 +86,95 @@ const activeRun = {
   status: "running",
 };
 
+const payload = {
+  runId: "run_1",
+  configId: "config_1",
+  billingCustomer,
+  projectId: "project_1",
+  domain: "example.com",
+  locationCode: 2840,
+  languageCode: "en",
+  devices: "desktop" as "desktop" | "mobile" | "both",
+  serpDepth: 10,
+  trigger: "manual" as const,
+};
+
+function keywords(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `kw_${index}`,
+    keyword: `keyword ${index}`,
+  }));
+}
+
+function runWorkflow(
+  overrides: Partial<typeof payload> & { maxCostCredits?: number },
+) {
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the mocked base class does not inspect Worker constructor context
+  const workflow = new RankCheckWorkflow({} as ExecutionContext, {} as Env);
+  return workflow.run(
+    {
+      instanceId: "run_1",
+      timestamp: new Date(),
+      payload: { ...payload, ...overrides },
+    },
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- workflow steps are executed directly by the pgStep mock
+    {} as WorkflowStep,
+  );
+}
+
 describe("rank check workflow credit ceiling", () => {
   beforeEach(() => {
+    mocks.getConfigById.mockResolvedValue({ isActive: true });
     mocks.getRunById.mockResolvedValue(activeRun);
+    mocks.getSnapshotsForRun.mockResolvedValue([]);
     mocks.updateRun.mockResolvedValue(undefined);
     mocks.isHostedServerAuthMode.mockResolvedValue(true);
     mocks.autumnCheck.mockResolvedValue({ balance: { remaining: 1_000 } });
   });
 
   it("rejects a keyword-list race before balance or DataForSEO calls", async () => {
-    mocks.getConfigById.mockResolvedValue({ isActive: true });
-    mocks.getKeywordsForConfig.mockResolvedValue(
-      Array.from({ length: 5 }, (_, index) => ({
-        id: `kw_${index}`,
-        keyword: `keyword ${index}`,
-      })),
-    );
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the mocked base class does not inspect Worker constructor context
-    const workflow = new RankCheckWorkflow({} as ExecutionContext, {} as Env);
+    mocks.getKeywordsForConfig.mockResolvedValue(keywords(5));
 
-    await expect(
-      workflow.run(
-        {
-          instanceId: "run_1",
-          timestamp: new Date(),
-          payload: {
-            runId: "run_1",
-            configId: "config_1",
-            billingCustomer,
-            projectId: "project_1",
-            domain: "example.com",
-            locationCode: 2840,
-            languageCode: "en",
-            devices: "desktop",
-            serpDepth: 10,
-            trigger: "manual",
-            maxCostCredits: 12,
-          },
-        },
-        // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- workflow steps are executed directly by the pgStep mock
-        {} as WorkflowStep,
-      ),
-    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    await expect(runWorkflow({ maxCostCredits: 20 })).rejects.toThrow();
 
     expect(mocks.autumnCheck).not.toHaveBeenCalled();
     expect(mocks.createDataforseoClient).not.toHaveBeenCalled();
     expect(mocks.runLiveCheck).not.toHaveBeenCalled();
   });
 
-  it("accepts the same reloaded list at the approved ceiling", async () => {
-    mocks.getKeywordsForConfig.mockResolvedValue(
-      Array.from({ length: 4 }, (_, index) => ({
-        id: `kw_${index}`,
-        keyword: `keyword ${index}`,
-      })),
+  it("keeps a credits refusal as the bare code, so the credits card shows", async () => {
+    mocks.getKeywordsForConfig.mockResolvedValue(keywords(5));
+    mocks.autumnCheck.mockResolvedValue({ balance: { remaining: 0 } });
+
+    await expect(runWorkflow({})).rejects.toThrow("INSUFFICIENT_CREDITS");
+
+    expect(mocks.failRunIfActive).toHaveBeenCalledWith(
+      "run_1",
+      "INSUFFICIENT_CREDITS",
     );
-
-    const result = await prepareRankCheckKeywords({
-      runId: "run_1",
-      configId: "config_1",
-      billingCustomer,
-      devices: "desktop",
-      serpDepth: 10,
-      trigger: "manual",
-      maxCostCredits: 12,
+    expect(mocks.updateConfig).toHaveBeenCalledWith("config_1", "project_1", {
+      lastSkipReason: "insufficient_credits",
     });
-
-    expect(result.keywords).toHaveLength(4);
-    expect(mocks.autumnCheck).toHaveBeenCalledTimes(2);
   });
 
-  it("preserves callers that do not provide a ceiling", async () => {
-    mocks.getKeywordsForConfig.mockResolvedValue(
-      Array.from({ length: 5 }, (_, index) => ({
-        id: `kw_${index}`,
-        keyword: `keyword ${index}`,
-      })),
-    );
-    mocks.isHostedServerAuthMode.mockResolvedValue(false);
+  // Exactly at the ceiling is approved (the guard is strictly greater), and
+  // callers without a ceiling — every scheduled check — must not be treated
+  // as approving zero credits.
+  it.each([
+    ["at the approved ceiling", 20, 4],
+    ["without a ceiling", undefined, 5],
+  ])("checks the reloaded list %s", async (_label, maxCostCredits, count) => {
+    mocks.getKeywordsForConfig.mockResolvedValue(keywords(count));
 
-    const result = await prepareRankCheckKeywords({
-      runId: "run_1",
-      configId: "config_1",
-      billingCustomer,
-      devices: "desktop",
-      serpDepth: 10,
-      trigger: "manual",
+    await runWorkflow({ maxCostCredits });
+
+    expect(mocks.updateRun).toHaveBeenCalledWith("run_1", {
+      keywordsTotal: count,
     });
-
-    expect(result.keywords).toHaveLength(5);
-    expect(mocks.autumnCheck).not.toHaveBeenCalled();
+    expect(mocks.runLiveCheck).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ keywords: keywords(count) }),
+    );
   });
 });
 
@@ -173,12 +187,7 @@ describe("rank check finalization", () => {
       // Recorded by the batch step on the first rejected keyword.
       errorMessage: "Invalid Field: 'location_name'.",
     });
-    mocks.getKeywordsForConfig.mockResolvedValue(
-      Array.from({ length: 3 }, (_, index) => ({
-        id: `kw_${index}`,
-        keyword: `keyword ${index}`,
-      })),
-    );
+    mocks.getKeywordsForConfig.mockResolvedValue(keywords(3));
     mocks.getSnapshotsForRun.mockResolvedValue([]);
     mocks.updateRun.mockResolvedValue(undefined);
     mocks.isHostedServerAuthMode.mockResolvedValue(true);
@@ -186,29 +195,7 @@ describe("rank check finalization", () => {
   });
 
   it("fails a run where no keyword produced a snapshot, keeping the recorded reason", async () => {
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the mocked base class does not inspect Worker constructor context
-    const workflow = new RankCheckWorkflow({} as ExecutionContext, {} as Env);
-
-    await workflow.run(
-      {
-        instanceId: "run_1",
-        timestamp: new Date(),
-        payload: {
-          runId: "run_1",
-          configId: "config_1",
-          billingCustomer,
-          projectId: "project_1",
-          domain: "example.com",
-          locationCode: 2840,
-          languageCode: "en",
-          devices: "desktop",
-          serpDepth: 10,
-          trigger: "manual",
-        },
-      },
-      // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- workflow steps are executed directly by the pgStep mock
-      {} as WorkflowStep,
-    );
+    await runWorkflow({});
 
     expect(mocks.updateRun).toHaveBeenCalledWith(
       "run_1",
@@ -218,5 +205,143 @@ describe("rank check finalization", () => {
       }),
     );
     expect(mocks.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it("reports a run that missed a whole device as partial", async () => {
+    mocks.getSnapshotsForRun.mockResolvedValue(
+      keywords(3).map((kw) => ({
+        trackingKeywordId: kw.id,
+        device: "desktop",
+      })),
+    );
+
+    await runWorkflow({ devices: "both" });
+
+    expect(mocks.updateRun).toHaveBeenCalledWith(
+      "run_1",
+      expect.objectContaining({
+        status: "completed",
+        keywordsChecked: 3,
+        errorMessage:
+          'Checked 3 of 3 desktop and 0 of 3 mobile keyword(s): Invalid Field: \'location_name\'. Not checked: "keyword 0" (mobile), "keyword 1" (mobile), "keyword 2" (mobile).',
+      }),
+    );
+  });
+
+  it("leaves a bare error code out of a partial run's message", async () => {
+    mocks.getRunById.mockResolvedValue({
+      ...activeRun,
+      keywordsTotal: 2,
+      errorMessage: "UPSTREAM_UNAVAILABLE",
+    });
+    mocks.getKeywordsForConfig.mockResolvedValue(keywords(2));
+    mocks.getSnapshotsForRun.mockResolvedValue([
+      { trackingKeywordId: "kw_0", device: "desktop" },
+    ]);
+
+    await runWorkflow({});
+
+    expect(mocks.updateRun).toHaveBeenCalledWith(
+      "run_1",
+      expect.objectContaining({
+        status: "completed",
+        errorMessage: 'Checked 1 of 2 keyword(s). Not checked: "keyword 1".',
+      }),
+    );
+  });
+
+  it("names the keywords a partial run could not check", async () => {
+    mocks.getRunById.mockResolvedValue({
+      ...activeRun,
+      keywordsTotal: 12,
+      errorMessage: "Internal SE Server Error.",
+    });
+    mocks.getKeywordsForConfig.mockResolvedValue(keywords(12));
+    mocks.getSnapshotsForRun.mockResolvedValue([
+      { trackingKeywordId: "kw_0", device: "desktop" },
+    ]);
+
+    await runWorkflow({});
+
+    expect(mocks.updateRun).toHaveBeenCalledWith(
+      "run_1",
+      expect.objectContaining({
+        status: "completed",
+        errorMessage: `Checked 1 of 12 keyword(s): Internal SE Server Error. Not checked: "keyword 1", "keyword 2", "keyword 3", "keyword 4", "keyword 5", "keyword 6", "keyword 7", "keyword 8", "keyword 9", "keyword 10" and 1 more.`,
+      }),
+    );
+  });
+});
+
+const gotoUrl = (id: number) => `https://google.com/goto?url=${id}`;
+
+describe("rank check goto URLs", () => {
+  const gotoSnapshot = (id: number) => ({
+    id,
+    trackingKeywordId: `kw_${id}`,
+    device: "desktop",
+    url: gotoUrl(id),
+  });
+
+  beforeEach(() => {
+    mocks.getConfigById.mockResolvedValue({ isActive: true });
+    mocks.getRunById.mockResolvedValue({ ...activeRun, keywordsTotal: 1 });
+    mocks.getKeywordsForConfig.mockResolvedValue(keywords(1));
+    mocks.updateRun.mockResolvedValue(undefined);
+    mocks.isHostedServerAuthMode.mockResolvedValue(true);
+    mocks.autumnCheck.mockResolvedValue({ balance: { remaining: 1_000 } });
+    mocks.resolveGotoUrls.mockResolvedValue(new Map());
+  });
+
+  it("saves the real page for a goto result, without Google's srsltid", async () => {
+    mocks.getSnapshotsForRun.mockResolvedValue([
+      gotoSnapshot(1),
+      { ...gotoSnapshot(2), url: "https://example.com/direct" },
+      { ...gotoSnapshot(3), position: null, url: null },
+    ]);
+    mocks.resolveGotoUrls.mockResolvedValue(
+      new Map([[gotoUrl(1), "https://example.com/page?id=1&srsltid=abc"]]),
+    );
+
+    await runWorkflow({});
+
+    expect(mocks.resolveGotoUrls).toHaveBeenCalledExactlyOnceWith([gotoUrl(1)]);
+    expect(mocks.updateSnapshotUrls).toHaveBeenCalledExactlyOnceWith([
+      { id: 1, url: "https://example.com/page?id=1" },
+    ]);
+  });
+
+  it("keeps a goto link the converter can't resolve", async () => {
+    mocks.getSnapshotsForRun.mockResolvedValue([gotoSnapshot(1)]);
+
+    await runWorkflow({});
+
+    expect(mocks.updateSnapshotUrls).toHaveBeenCalledExactlyOnceWith([]);
+  });
+
+  it("splits a large run across converter requests", async () => {
+    mocks.getSnapshotsForRun.mockResolvedValue(
+      [1, 2, 3].map((id) => gotoSnapshot(id)),
+    );
+
+    await runWorkflow({});
+
+    expect(mocks.resolveGotoUrls.mock.calls).toEqual([
+      [[gotoUrl(1), gotoUrl(2)]],
+      [[gotoUrl(3)]],
+    ]);
+  });
+
+  it("still finishes the run when the converter fails", async () => {
+    mocks.getSnapshotsForRun.mockResolvedValue([gotoSnapshot(1)]);
+    mocks.resolveGotoUrls.mockRejectedValue(new Error("converter down"));
+
+    await runWorkflow({});
+
+    expect(mocks.updateSnapshotUrls).not.toHaveBeenCalled();
+    expect(mocks.updateRun).toHaveBeenCalledWith(
+      "run_1",
+      expect.objectContaining({ status: "completed", errorMessage: null }),
+    );
   });
 });

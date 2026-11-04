@@ -1,3 +1,4 @@
+import { getDomain } from "tldts";
 import { z } from "zod";
 import type { BillingCustomerContext } from "@/server/billing/subscription";
 import type { CreditFeature } from "@/shared/billing-credit-features";
@@ -7,13 +8,12 @@ import {
   type BacklinksHistoryItem,
   type BacklinksSummaryItem,
 } from "@/server/lib/dataforseo";
-import {
-  normalizeBacklinksSpamFilterOptions,
-  type BacklinksLookupInput,
-  type BacklinksRowsPageInput,
-  type BacklinksSpamFilterOptions,
-  type ReferringDomainsPageInput,
-  type TopPagesPageInput,
+import type {
+  BacklinksLookupInput,
+  BacklinksRowsPageInput,
+  BacklinksSpamFilterOptions,
+  ReferringDomainsPageInput,
+  TopPagesPageInput,
 } from "@/types/schemas/backlinks";
 
 import {
@@ -130,11 +130,26 @@ export async function profileBacklinksOverview(
     // so trends are unavailable for a page and subdomain-inclusive otherwise.
     normalizedTarget.scope === "exact_url"
       ? Promise.resolve([])
-      : dataforseo.backlinks.history({
-          target: normalizedTarget.apiTarget,
-          ...dateRange,
-          creditFeature,
-        }),
+      : dataforseo.backlinks
+          .history({
+            target: normalizedTarget.apiTarget,
+            ...dateRange,
+            creditFeature,
+          })
+          .catch((error: unknown) => {
+            // History fails for some subdomains (health.oregonstate.edu) whose
+            // summary loads fine; show the summary without trends.
+            if (
+              getDomain(normalizedTarget.apiTarget) ===
+              normalizedTarget.apiTarget
+            )
+              throw error;
+            console.warn(
+              `[backlinks] history unavailable for ${normalizedTarget.apiTarget}:`,
+              error,
+            );
+            return [];
+          }),
   ]);
 
   const overview = buildOverviewResult({
@@ -178,7 +193,7 @@ export async function profileBacklinksRowsPage(
   assertFilterConditionBudget(
     scopeFilter.conditionCount +
       countExpressionConditions(userFilters) +
-      (normalizeBacklinksSpamFilterOptions(spamOptions).hideSpam ? 1 : 0),
+      ((spamOptions?.hideSpam ?? true) ? 2 : 0),
   );
   const filters = prependScopeClauses(scopeFilter, userFilters);
 

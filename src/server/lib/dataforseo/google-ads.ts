@@ -8,7 +8,7 @@ import {
 } from "@/server/lib/dataforseo/envelope";
 
 // Google Ads keyword data for countries DataForSEO Labs doesn't cover (see
-// specs/0004-keyword-data-source-routing.md). Flat-priced per request; items
+// docs/maintainers/specs/0004-keyword-data-source-routing.md). Flat-priced per request; items
 // carry volume / CPC / competition but no keyword difficulty or intent.
 export interface AdsKeywordItem {
   keyword?: string | null;
@@ -31,6 +31,26 @@ function taskItems<T>(task: KeywordsDataTask<T>): T[] {
   return task.result ?? [];
 }
 
+// Google Ads fails the whole search_volume task when one keyword has one of
+// these symbols or an emoji, is longer than 80 characters, or has more than
+// 10 words.
+const ADS_INVALID_KEYWORD_CHARS =
+  /[!@%,*(){}<>|^~;=?`]|\p{Extended_Pictographic}/u;
+
+/** Whether Google Ads search_volume accepts this keyword text. */
+export function isAdsKeyword(keyword: string): boolean {
+  return (
+    keyword.length <= 80 &&
+    keyword.split(/\s+/).length <= 10 &&
+    !ADS_INVALID_KEYWORD_CHARS.test(keyword)
+  );
+}
+
+// Google Ads names Norwegian "no". Project markets use Bokmål "nb".
+function adsLanguageCode(languageCode: string): string {
+  return languageCode === "nb" ? "no" : languageCode;
+}
+
 export async function fetchAdsSearchVolume(input: {
   keywords: string[];
   locationCode: number;
@@ -51,7 +71,7 @@ export async function fetchAdsSearchVolume(input: {
       {
         keywords: input.keywords,
         ...locationParams,
-        language_code: input.languageCode,
+        language_code: adsLanguageCode(input.languageCode),
       },
     ],
   );
@@ -74,7 +94,7 @@ export async function fetchAdsKeywordIdeas(input: {
       {
         keywords: [input.keyword],
         location_code: input.locationCode,
-        language_code: input.languageCode,
+        language_code: adsLanguageCode(input.languageCode),
         sort_by: "search_volume",
       },
     ],

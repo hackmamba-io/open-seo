@@ -7,14 +7,15 @@ import { Ga4OrganicOverviewService } from "@/server/features/ga4/services/Ga4Org
 import { Ga4Service } from "@/server/features/ga4/services/Ga4Service";
 import { AppError } from "@/server/lib/errors";
 import { Ga4ReportError } from "@/server/lib/ga4Errors";
-import { hasSelfHostedGoogleOAuthConfig } from "@/server/features/google/oauth-config";
+import { hasGoogleOAuthConfig } from "@/server/features/google/oauth-config";
+import { getGoogleAccessMode } from "@/server/features/google/googleAccess";
+import { getGatewayGoogleConnectUrl } from "@/server/features/google/gatewayGoogle";
 import {
-  createSelfHostedGoogleAuthorizationUrl,
+  createGoogleAuthorizationUrl,
   GA4_INTEGRATION,
-} from "@/server/features/google/selfHostedOAuth";
+} from "@/server/features/google/googleOAuth";
 import { hasOrgPermission } from "@/lib/org-permissions";
 import { requireOrgPermission } from "@/server/auth/org-gate";
-import { isHostedServerAuthMode } from "@/server/lib/runtime-env";
 import { captureServerEvent } from "@/server/lib/posthog";
 import { getPublicOrigin } from "@/server/mcp/public-origin";
 import {
@@ -27,7 +28,7 @@ const setPropertySchema = projectScopedSchema.extend({
   accountId: z.string().min(1),
   propertyId: z.string().regex(/^properties\/\d+$/),
 });
-const startSelfHostedLinkSchema = z.object({
+const startLinkSchema = z.object({
   callbackURL: z.string().min(1),
 });
 
@@ -35,18 +36,17 @@ export const getGa4Connection = createServerFn({ method: "POST" })
   .middleware(requireProjectContext)
   .validator(projectScopedSchema)
   .handler(async ({ context }) => {
-    const [connection, currentUserHasGrant, hosted, ga4Configured] =
+    const [connection, currentUserHasGrant, googleOAuthConfigured] =
       await Promise.all([
         Ga4Service.getConnection(context.projectId),
         Ga4Service.userHasGrant(context.userId),
-        isHostedServerAuthMode(),
-        hasSelfHostedGoogleOAuthConfig(),
+        hasGoogleOAuthConfig(),
       ]);
     return {
       connected: Boolean(connection),
       canManage: hasOrgPermission(context.role, { integration: ["manage"] }),
       currentUserHasGrant,
-      googleOAuthConfigured: hosted || ga4Configured,
+      googleOAuthConfigured,
       propertyId: connection?.propertyId ?? null,
       propertyDisplayName: connection?.propertyDisplayName ?? null,
       propertyTimeZone: connection?.propertyTimeZone ?? null,
@@ -209,17 +209,17 @@ export const disconnectGa4 = createServerFn({ method: "POST" })
     return { connected: false as const };
   });
 
-export const startSelfHostedGa4Link = createServerFn({ method: "POST" })
+export const startGa4Link = createServerFn({ method: "POST" })
   .middleware(requireAuthenticatedContext)
-  .validator(startSelfHostedLinkSchema)
+  .validator(startLinkSchema)
   .handler(async ({ data, context }) => ({
-    url: await createSelfHostedGoogleAuthorizationUrl({
-      integration: GA4_INTEGRATION,
-      user: {
-        userId: context.userId,
-        userEmail: context.userEmail,
-      },
-      callbackURL: data.callbackURL,
-      publicOrigin: getPublicOrigin(getRequest()),
-    }),
+    url:
+      (await getGoogleAccessMode()) === "gateway"
+        ? await getGatewayGoogleConnectUrl(data.callbackURL)
+        : await createGoogleAuthorizationUrl({
+            integration: GA4_INTEGRATION,
+            userId: context.userId,
+            callbackURL: data.callbackURL,
+            publicOrigin: getPublicOrigin(getRequest()),
+          }),
   }));

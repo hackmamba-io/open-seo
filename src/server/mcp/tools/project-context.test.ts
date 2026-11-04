@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
   listKeyPages: vi.fn(),
   listResearchLog: vi.fn(),
   listTemplates: vi.fn(),
+  deleteSection: vi.fn(),
+  deleteResearchLogEntries: vi.fn(),
 }));
 
 vi.mock("cloudflare:workers", () => ({ env: {} }));
@@ -51,6 +53,31 @@ beforeEach(() => {
 });
 
 describe("update_project_context", () => {
+  // Custom sections share the sections table with typed ones under a prefixed
+  // key; a delete that misses the prefix silently leaves the section behind.
+  it("deletes custom sections by their prefixed key and research log entries by id", async () => {
+    await updateProjectContextTool.handler(
+      {
+        projectId: "project_1",
+        updates: [
+          { deleteCustomSection: "old-findings" },
+          { removeResearchLog: ["research_1"] },
+        ],
+      },
+      makeToolContext(),
+    );
+    expect(mocks.deleteSection).toHaveBeenCalledWith(
+      expect.anything(),
+      "project_1",
+      "custom:old-findings",
+    );
+    expect(mocks.deleteResearchLogEntries).toHaveBeenCalledWith(
+      expect.anything(),
+      "project_1",
+      ["research_1"],
+    );
+  });
+
   // Provenance is the contract: a write arriving over MCP must be attributable
   // to MCP in the UI, and silently recording it as a user edit would be
   // invisible everywhere else.
@@ -95,15 +122,8 @@ describe("get_project_context", () => {
   it("lists the project's report templates", async () => {
     mocks.listTemplates.mockResolvedValue([
       {
-        id: "template_1",
-        projectId: "project_1",
         name: "Monthly client check-in",
         description: "The monthly update we send retainer clients.",
-        instructions: "Audience: the client's marketing lead.",
-        createdBy: "OpenSEO app",
-        createdByUserId: "user_1",
-        createdAt: "2026-09-01T10:00:00.000Z",
-        updatedAt: "2026-09-01T10:00:00.000Z",
       },
     ]);
 

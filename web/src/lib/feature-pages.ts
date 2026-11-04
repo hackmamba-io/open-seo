@@ -6,6 +6,8 @@ export type FeaturePage = {
   navDescription: string;
   title: string;
   description: string;
+  /** Meta description override. Falls back to `description`, which also renders on the page. */
+  seoDescription?: string;
   primaryKeyword: string;
   secondaryKeywords: string[];
   imageAlt: string;
@@ -47,6 +49,40 @@ export type FeaturePage = {
       href: string;
     };
   };
+  /** Per-page section headings. Each falls back to the template's default label. */
+  headings?: {
+    workflows?: string;
+    metrics?: string;
+    useCases?: string;
+    differentiators?: string;
+    related?: string;
+    faq?: string;
+  };
+  /** Free tools shown as cards under the hero. Takes the place of `featuredLink`. */
+  toolCallout?: {
+    title: string;
+    description: string;
+    links: Array<{
+      title: string;
+      description: string;
+      href: string;
+    }>;
+  };
+  /** Longer sections that answer the questions competing pages answer. */
+  contextSections?: Array<{
+    title: string;
+    body: string;
+  }>;
+  /** A data image shown with the context sections. */
+  contextImage?: {
+    src: string;
+    alt: string;
+    caption: string;
+    width: number;
+    height: number;
+  };
+  /** Emit SoftwareApplication, FAQPage and BreadcrumbList JSON-LD. */
+  structuredData?: boolean;
 };
 
 export const featurePages = {
@@ -54,9 +90,11 @@ export const featurePages = {
     slug: FEATURE_PAGE_SLUGS.keywordResearch,
     eyebrow: "Keyword Research",
     navDescription: "Find keyword ideas and SERPs.",
-    title: "Keyword research tool for practical SEO planning",
+    title: "Keyword research tool that shows the SERP behind every number",
     description:
       "Find keyword ideas, compare search volume and difficulty, inspect SERP results, and save the opportunities worth building around.",
+    seoDescription:
+      "Find keyword ideas with search volume and difficulty, check the Google results behind each one, and save the ones worth writing. Free to start, then $10/month.",
     primaryKeyword: "keyword research tool",
     secondaryKeywords: [
       "seo keyword research tool",
@@ -100,6 +138,55 @@ export const featurePages = {
       "DataForSEO-backed metrics without locking the research process into a black box.",
       "MCP access so AI agents can research and save keywords for you.",
     ],
+    headings: {
+      workflows: "Find ideas, check the SERP, save what's worth writing",
+      metrics: "What comes with every keyword",
+      useCases: "When teams open keyword research",
+      differentiators: "Why research here instead of a $100+ suite",
+      related: "Where the research goes next",
+      faq: "Keyword research questions",
+    },
+    toolCallout: {
+      title: "Start with one topic before you sign up",
+      description: "Two free tools from OpenSEO. No signup required.",
+      links: [
+        {
+          title: "Free keyword generator",
+          description:
+            "Type a topic and get up to 20 keyword ideas with search volume and difficulty.",
+          href: "/keyword-generator",
+        },
+        {
+          title: "Free competitor analysis",
+          description:
+            "See a competitor's top 20 keywords and up to 20 they rank for that you don't.",
+          href: "/competitor-analysis",
+        },
+      ],
+    },
+    contextSections: [
+      {
+        title: "Why the SERP matters more than the numbers",
+        body: 'Volume and difficulty don\'t tell you what an idea means. Seed "keyword research" and you get 300 ideas, but only 45 of them contain the word "keyword". The biggest, easiest-looking one is "research synonyms", with 14,800 searches a month and a difficulty of 0, and nobody searching it wants an SEO tool. Open the results page for an idea before you write for it. If the pages ranking don\'t match what you sell, the numbers don\'t matter.',
+      },
+      {
+        title: "How it compares with Google Keyword Planner and free tools",
+        body: "Google Keyword Planner is the free option most guides point to, and it sits inside Google Ads. OpenSEO's free keyword generator is the quick version of this tool: one topic in, up to 20 ideas out, with volume and difficulty and no account. The full tool returns up to 500 ideas per search and adds CPC, search intent and the live results page for each keyword. Full metrics cover 94 countries. Elsewhere the data comes from Google Ads, which has volume and CPC but no difficulty or intent.",
+      },
+      {
+        title: "Keyword research with ChatGPT or Claude, using real numbers",
+        body: "Ask a chat assistant for search volumes and it will guess. Connect OpenSEO over MCP and the assistant pulls keyword ideas and metrics from the same data this page uses. The keyword research skill gives it an order of work: expand a seed, check who ranks, then save the keepers to your list. You keep the conversation, and every number can be checked.",
+      },
+    ],
+    contextImage: {
+      src: "/features/keyword-research/openseo-keyword-research-ideas-on-topic.png",
+      alt: "Scatter chart of 290 keyword ideas for the seed keyword research, plotting monthly US searches against keyword difficulty. 45 ideas that contain the word keyword are orange; the rest are grey, led by research synonyms at 14,800 searches a month and difficulty 0.",
+      caption:
+        "300 ideas from one seed. The easiest, biggest ones are off-topic.",
+      width: 1600,
+      height: 900,
+    },
+    structuredData: true,
     related: [
       { label: "Keyword Clustering", href: "/docs/skills/keyword-clustering" },
       {
@@ -123,6 +210,16 @@ export const featurePages = {
         question: "Does OpenSEO show live search results?",
         answer:
           "Yes. Keyword research can be paired with SERP inspection so you can see ranking pages alongside the metrics.",
+      },
+      {
+        question: "How many keyword ideas does one search return?",
+        answer:
+          "Up to 500. You pick 150, 300 or 500 before you run the search. The free keyword generator returns up to 20 without signup.",
+      },
+      {
+        question: "Which countries have keyword data?",
+        answer:
+          "94 countries get full metrics, including keyword difficulty and search intent. Other countries are served from Google Ads data, which has search volume and CPC but no difficulty or intent.",
       },
     ],
     guides: {
@@ -167,6 +264,8 @@ export const featurePages = {
     title: "SEO audit tool for finding technical issues fast",
     description:
       "Crawl a site, collect page-level technical signals, and optionally run Lighthouse checks for performance, SEO, accessibility, and best-practice issues.",
+    seoDescription:
+      "Crawl your site and get every technical issue sorted by severity: broken links, blocked pages, missing titles, optional Lighthouse checks. Free up to 50 pages.",
     primaryKeyword: "seo audit tool",
     secondaryKeywords: [
       "seo site audit",
@@ -210,6 +309,12 @@ export const featurePages = {
       "Open-source implementation for teams that want to inspect or extend the audit flow.",
       "Simple reports that expose page-level signals and optional Lighthouse findings instead of relying only on a generic score.",
     ],
+    featuredLink: {
+      title: "Free SERP simulator",
+      description:
+        "Preview how a title and meta description render on Google, with pixel widths. No signup required.",
+      href: "/serp-simulator",
+    },
     related: [
       { label: "Domain Overview", href: "/features/domain-overview" },
       { label: "Backlinks", href: "/features/backlink-checker" },
@@ -269,6 +374,8 @@ export const featurePages = {
     title: "Backlink checker for understanding a domain's link profile",
     description:
       "Analyze backlinks, referring domains, and linked pages without separating link research from the rest of your SEO workspace.",
+    seoDescription:
+      "Go past a quick backlink check: page through every link, see anchors, filter out spam and lost links, and export the list for any domain. $10/month.",
     primaryKeyword: "backlink analysis",
     secondaryKeywords: [
       "backlink analysis tool",
@@ -353,7 +460,6 @@ export const featurePages = {
         href: "/docs/skills/link-prospecting",
       },
       { label: "Domain Overview", href: "/features/domain-overview" },
-      { label: "OpenSEO MCP", href: "/features/mcp" },
     ],
     faqs: [
       {
@@ -423,6 +529,12 @@ export const featurePages = {
       "Built around ranking keywords, estimated traffic, and top pages for practical competitor research.",
       "Open-source and self-hostable for teams that want control over their SEO stack.",
     ],
+    featuredLink: {
+      title: "Free website traffic checker",
+      description:
+        "Estimate any domain's organic traffic, keywords, and top pages. No signup required.",
+      href: "/website-traffic-checker",
+    },
     related: [
       {
         label: "Competitor Analysis",
@@ -496,6 +608,8 @@ export const featurePages = {
     title: "Rank tracker for monitoring keyword positions",
     description:
       "Track the keywords that matter, optionally compare desktop and mobile results, and keep ranking changes connected to your research workflow.",
+    seoDescription:
+      "Track keyword positions on desktop and mobile, daily, weekly or monthly. 100 keywords checked weekly uses about $1-2 of credits a month, shown before each run.",
     primaryKeyword: "rank tracker",
     secondaryKeywords: [
       "seo rank tracking tool",
@@ -539,6 +653,12 @@ export const featurePages = {
       "Optional desktop and mobile tracking helps teams avoid one-dimensional rank reports.",
       "OpenSEO can expose ranking data to AI agents through MCP.",
     ],
+    featuredLink: {
+      title: "Free competitor keyword finder",
+      description:
+        "Find the keywords a competitor ranks for before choosing what to track. No signup required.",
+      href: "/competitor-keyword-finder",
+    },
     related: [
       { label: "Keyword Clustering", href: "/docs/skills/keyword-clustering" },
       {
@@ -606,6 +726,8 @@ export const featurePages = {
     title: "Saved keywords for turning SEO research into a plan",
     description:
       "Keep useful keyword ideas organized so they can inform content planning, rank tracking decisions, and AI-agent workflows.",
+    seoDescription:
+      "Save keyword ideas with volume and difficulty attached, tag them by page or topic, and reuse the list for content plans, rank tracking and AI agents.",
     primaryKeyword: "saved keywords",
     secondaryKeywords: [
       "seo keyword list",
@@ -674,10 +796,12 @@ export const featurePages = {
   aiBrandVisibility: {
     slug: FEATURE_PAGE_SLUGS.aiBrandVisibility,
     eyebrow: "AI Visibility",
-    navDescription: "Look up brand mentions in AI search.",
-    title: "Brand lookup for ChatGPT and Google AI Overview visibility",
+    navDescription: "Research prompts and track mentions and citations.",
+    title: "Track your brand in AI answers",
     description:
-      "Look up a brand or domain and review ChatGPT and Google AI Overview mentions, cited pages, and related prompts.",
+      "Research prompts, then track brand mentions, cited pages, and competitor appearances in ChatGPT, Gemini, and Google AI Overviews.",
+    seoDescription:
+      "See where ChatGPT, Gemini and Google AI Overviews mention your brand, which pages they cite, and which competitors appear instead. Open source, $10/month.",
     primaryKeyword: "ai visibility tool",
     secondaryKeywords: [
       "brand visibility ai search",
@@ -689,19 +813,19 @@ export const featurePages = {
       "https://imagedelivery.net/ysLOa6bzFaM49Jxok-TAlw/cde3e4f8-079f-4890-cb17-371087107400/public",
     workflows: [
       {
-        title: "Look up a brand",
+        title: "Research prompts",
         description:
-          "Search for a brand or domain and inspect how ChatGPT and Google AI Overview mention or cite it in available results.",
+          "Find the questions people ask about a keyword, see what ChatGPT answers and cites, and choose questions to track.",
       },
       {
-        title: "Review citations and platforms",
+        title: "Track answers over time",
         description:
-          "Review the URLs, domains, and platforms contributing to brand mentions.",
+          "Preview cost, then run a check or schedule daily, weekly, or monthly collection in your selected market.",
       },
       {
-        title: "Find visibility gaps",
+        title: "Review competitors and citations",
         description:
-          "Use cited pages and related prompts as clues for content, reputation, or comparison coverage to investigate.",
+          "Use your saved project competitors and captured answers to see which brands and pages appear.",
       },
     ],
     metrics: [
@@ -711,7 +835,7 @@ export const featurePages = {
       { label: "Cited domains", value: "Sources" },
     ],
     useCases: [
-      "See whether ChatGPT and Google AI Overview data mention or cite your brand or domain.",
+      "See whether tracked ChatGPT, Gemini, and Google AI Overviews answers mention your brand or cite your website.",
       "Find pages and domains cited alongside brand mentions.",
       "Use cited sources and prompts to plan content experiments for answer-engine visibility.",
     ],
@@ -721,7 +845,8 @@ export const featurePages = {
       "OpenSEO helps teams connect AI mention and citation research to concrete SEO planning.",
     ],
     related: [
-      { label: "AI Search Prompts", href: "/features/ai-search-prompts" },
+      { label: "AI Visibility Guide", href: "/docs/ai-visibility" },
+      { label: "Prompt Explorer", href: "/features/ai-search-prompts" },
       { label: "Domain Overview", href: "/features/domain-overview" },
       { label: "OpenSEO MCP", href: "/features/mcp" },
     ],
@@ -729,7 +854,7 @@ export const featurePages = {
       {
         question: "What is AI brand visibility?",
         answer:
-          "AI brand visibility is how often your brand or domain appears in available ChatGPT and Google AI Overview mention and citation data.",
+          "It describes brand mentions and website citations in the prompts, engines, and market you track. It does not measure every AI conversation or traffic to your site.",
       },
       {
         question: "How is AI visibility different from traditional SEO?",
@@ -749,7 +874,9 @@ export const featurePages = {
     navDescription: "Compare answers across supported models.",
     title: "AI search prompt explorer for visibility research",
     description:
-      "Run the same prompt across supported AI models, compare the answers, and review citations when they are returned.",
+      "Start with ChatGPT, or add Claude, Gemini, and Perplexity to compare API model answers and available citations.",
+    seoDescription:
+      "Run one prompt through ChatGPT, Claude, Gemini and Perplexity, then compare the answers and any sources each model cites. Answers come from each model's API.",
     primaryKeyword: "ai search visibility",
     secondaryKeywords: [
       "chatgpt search visibility",
@@ -788,12 +915,12 @@ export const featurePages = {
       "Check whether a brand appears in AI answers and citations.",
     ],
     differentiators: [
-      "Prompt research lives in the same workspace as domain, keyword, and brand visibility workflows.",
+      "Prompt Explorer lives beside Prompt Research and Prompt Tracking in your project.",
       "OpenSEO treats AI search as a research layer, not a replacement for SEO fundamentals.",
-      "OpenSEO MCP exposes keyword, SERP, domain, backlink, saved keyword, and rank-tracking tools to AI agents.",
+      "OpenSEO MCP lets your agent explore prompts and work with saved AI visibility results.",
     ],
     related: [
-      { label: "AI Brand Visibility", href: "/features/ai-brand-visibility" },
+      { label: "AI Visibility", href: "/features/ai-brand-visibility" },
       { label: "Keyword Research", href: "/features/keyword-research" },
       { label: "OpenSEO MCP", href: "/features/mcp" },
     ],

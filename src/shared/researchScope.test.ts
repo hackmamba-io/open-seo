@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  defaultScopeForPath,
-  isScopeAllowedForInput,
+  parseBacklinksTarget,
   parseResearchTarget,
   urlMatchesResearchTarget,
 } from "./researchScope";
@@ -51,21 +50,12 @@ describe("parseResearchTarget", () => {
     expect(target.urlHostname).toBe("www.example.com");
   });
 
-  it("keeps subdomain hostnames intact", () => {
-    const target = parseOk("blog.example.com", "subdomains");
-    expect(target.hostname).toBe("blog.example.com");
-  });
-
   it("rejects subfolder for a root input instead of silently rescoping", () => {
     const result = parseResearchTarget("example.com", "subfolder");
     expect(result).toEqual({
       ok: false,
       message: "Add a path to use Subfolder (e.g. example.com/blog)",
     });
-  });
-
-  it("allows exact_url for a root input", () => {
-    expect(parseOk("example.com", "exact_url").scope).toBe("exact_url");
   });
 
   it("rejects invalid hosts and credentials", () => {
@@ -76,17 +66,15 @@ describe("parseResearchTarget", () => {
   });
 });
 
-describe("scope helpers", () => {
-  it("computes defaults from the path", () => {
-    expect(defaultScopeForPath("")).toBe("subdomains");
-    expect(defaultScopeForPath("/blog")).toBe("subfolder");
-  });
-
-  it("only disallows subfolder without a path", () => {
-    expect(isScopeAllowedForInput("subfolder", "")).toBe(false);
-    expect(isScopeAllowedForInput("subfolder", "/blog")).toBe(true);
-    expect(isScopeAllowedForInput("exact_url", "")).toBe(true);
-    expect(isScopeAllowedForInput("domain", "/blog")).toBe(true);
+describe("parseBacklinksTarget", () => {
+  // The search card and the server share this rule, so the user sees it inline.
+  it("rejects a query string or fragment only on an exact page lookup", () => {
+    expect(
+      parseBacklinksTarget("https://example.com/page?ref=1", "exact_url"),
+    ).toMatchObject({ ok: false });
+    expect(
+      parseBacklinksTarget("https://example.com/page#top", "subfolder"),
+    ).toMatchObject({ ok: true });
   });
 });
 

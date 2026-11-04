@@ -15,7 +15,16 @@ import {
 import type { runBatch } from "@/db/runBatch";
 import type * as ServiceModule from "./GoogleAccountService";
 
+const oauth = vi.hoisted(() => ({
+  getGoogleAccessToken: vi.fn(),
+  revokeGoogleToken: vi.fn(),
+  deleteGscCache: vi.fn(),
+}));
 vi.mock("cloudflare:workers", () => ({ env: {} }));
+vi.mock("./googleOAuth", () => oauth);
+vi.mock("@/server/features/dashboard/services/DashboardCacheService", () => ({
+  DashboardCacheService: { deleteGscCache: oauth.deleteGscCache },
+}));
 let client: Client;
 const directory = mkdtempSync(join(tmpdir(), "google-account-removal-"));
 let service: typeof ServiceModule.GoogleAccountService;
@@ -43,7 +52,7 @@ beforeAll(async () => {
     INSERT INTO projects (id, archived) VALUES ('p1',0), ('p2',1), ('p3',0), ('p4',0);
   `);
   const authMigration = readFileSync(
-    "drizzle/0003_light_sage.sql",
+    "drizzle/sqlite/0003_light_sage.sql",
     "utf8",
   ).split("--> statement-breakpoint");
   await client.executeMultiple(
@@ -56,8 +65,8 @@ beforeAll(async () => {
       .join("\n"),
   );
   for (const file of [
-    "drizzle/0019_true_absorbing_man.sql",
-    "drizzle/0039_ga4_connections.sql",
+    "drizzle/sqlite/0019_true_absorbing_man.sql",
+    "drizzle/sqlite/0039_ga4_connections.sql",
   ]) {
     await client.executeMultiple(
       readFileSync(file, "utf8")
@@ -75,15 +84,29 @@ afterAll(() => {
   rmSync(directory, { recursive: true });
 });
 beforeEach(async () => {
+  oauth.getGoogleAccessToken.mockImplementation(
+    async ({ accountId }: { accountId: string }) => `token-${accountId}`,
+  );
   await client.executeMultiple(
     "DROP TRIGGER IF EXISTS fail_remove; DELETE FROM gsc_connections; DELETE FROM ga4_connections; DELETE FROM account;",
   );
 });
 
-async function grant(provider: string, accountId = "google-a", userId = "u1") {
+async function grant(
+  provider: string,
+  accountId = "google-a",
+  userId = "u1",
+  updatedAt = 1,
+) {
   await client.execute({
-    sql: "INSERT INTO account (id, account_id, provider_id, user_id, updated_at, access_token, refresh_token) VALUES (?, ?, ?, ?, 1, 'access', 'refresh')",
-    args: [`${provider}-${userId}-${accountId}`, accountId, provider, userId],
+    sql: "INSERT INTO account (id, account_id, provider_id, user_id, updated_at, access_token, refresh_token) VALUES (?, ?, ?, ?, ?, 'access', 'refresh')",
+    args: [
+      `${provider}-${userId}-${accountId}`,
+      accountId,
+      provider,
+      userId,
+      updatedAt,
+    ],
   });
 }
 async function mapping(
@@ -128,23 +151,6 @@ for (const provider of ["gsc", "ga4"] as const) {
     const table = provider === "gsc" ? "gsc_connections" : "ga4_connections";
     const input = { provider, accountId: "google-a", userId: "u1" };
 
-    it("deletes the authorization row so another OpenSEO user can claim the identity", async () => {
-      await grant(providerId);
-      await mapping(provider, "p1");
-      expect((await rows("account"))[0]?.user_id).toBe("u1");
-      await service.remove(input);
-      expect(await rows("account")).toEqual([]);
-      expect(await rows(table)).toEqual([]);
-      // Better Auth's link callback looks up this pair across all users.
-      const existing = await client.execute({
-        sql: "SELECT user_id FROM account WHERE provider_id = ? AND account_id = ?",
-        args: [providerId, "google-a"],
-      });
-      expect(existing.rows).toEqual([]);
-      await grant(providerId, "google-a", "u2");
-      expect((await rows("account"))[0]?.user_id).toBe("u2");
-    });
-
     it("removes all dependent mappings including archived and other-workspace projects", async () => {
       await grant(providerId);
       await mapping(provider, "p1");
@@ -184,16 +190,6 @@ for (const provider of ["gsc", "ga4"] as const) {
       expect(await rows(table)).toHaveLength(1);
     });
 
-    it("a repeated old-user removal does not delete the new owner's grant", async () => {
-      await grant(providerId);
-      await service.remove(input);
-      await grant(providerId, "google-a", "u2");
-      await mapping(provider, "p1", "google-a", "u2");
-      await service.remove(input);
-      expect((await rows("account"))[0]?.user_id).toBe("u2");
-      expect(await rows(table)).toHaveLength(1);
-    });
-
     it("rolls project deletion back if deleting the authorization fails", async () => {
       await grant(providerId);
       await mapping(provider, "p1");
@@ -224,6 +220,35 @@ it("includes legacy GSC mappings in removal without touching another user's lega
 });
 
 it.each(["same-account", "other-account", "other-user"] as const)(
+  "GA4 preserves a missing email only for the same connection identity: %s",
+  async (change) => {
+    const { Ga4ConnectionRepository } =
+      await import("@/server/features/ga4/repositories/Ga4ConnectionRepository");
+    const base = {
+      projectId: "p1",
+      organizationId: "org1",
+      propertyId: "properties/11",
+      propertyDisplayName: "Site",
+      propertyTimeZone: "America/New_York",
+      propertyCurrencyCode: "USD",
+      connectedByUserId: "u1",
+      ga4AccountId: "google-a",
+      connectedAccountEmail: "old@example.com",
+    };
+    await Ga4ConnectionRepository.upsert(base);
+    const saved = await Ga4ConnectionRepository.upsert({
+      ...base,
+      connectedByUserId: change === "other-user" ? "u2" : "u1",
+      ga4AccountId: change === "other-account" ? "google-b" : "google-a",
+      connectedAccountEmail: null,
+    });
+    expect(saved.connectedAccountEmail).toBe(
+      change === "same-account" ? "old@example.com" : null,
+    );
+  },
+);
+
+it.each(["same-account", "other-account", "other-user"] as const)(
   "GSC preserves a missing email only for the same connection identity: %s",
   async (change) => {
     const { GscConnectionRepository } =
@@ -250,3 +275,30 @@ it.each(["same-account", "other-account", "other-user"] as const)(
     );
   },
 );
+
+it("revokes a removed grant only once no stored grant uses that Google account", async () => {
+  await grant("google-search-console");
+  await grant("google-analytics");
+  const input = {
+    provider: "gsc" as const,
+    accountId: "google-a",
+    userId: "u1",
+  };
+  await service.remove(input);
+  expect(oauth.revokeGoogleToken).not.toHaveBeenCalled();
+  await service.remove({ ...input, provider: "ga4" });
+  expect(oauth.revokeGoogleToken.mock.calls).toEqual([["token-google-a"]]);
+});
+
+it("purges and revokes grants no project uses that were last updated before the cutoff", async () => {
+  await grant("google-search-console", "unused");
+  await grant("google-search-console", "mapped");
+  await grant("google-analytics", "recent", "u1", 2_000);
+  await mapping("gsc", "p1", "mapped");
+  expect(await service.purgeUnusedGrants(new Date(1_000))).toBe(1);
+  expect((await rows("account")).map((row) => row.account_id)).toEqual([
+    "recent",
+    "mapped",
+  ]);
+  expect(oauth.revokeGoogleToken.mock.calls).toEqual([["token-unused"]]);
+});

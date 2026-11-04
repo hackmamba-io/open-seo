@@ -18,8 +18,8 @@ import {
   REPORT_TEMPLATE_MAX_NAME_CHARS,
 } from "@/types/schemas/report-templates";
 
-// The two report-template tools. Both free (they touch only the app DB), both
-// wrapped in withMcpProjectAuth, and both scoped to the authorized project — a
+// Report-template tools are free (they touch only the app DB), all
+// wrapped in withMcpProjectAuth, and all scoped to the authorized project — a
 // template id from another project never resolves.
 
 const templatesPath = (projectId: string) =>
@@ -29,11 +29,11 @@ const templatesPath = (projectId: string) =>
 
 const listInputSchema = { projectId: projectIdSchema } as const;
 
-const listOutputSchema = {
+const listOutputSchema = z.looseObject({
   templates: z.array(looseObjectOutputSchema),
   remaining: z.number(),
   ...optionalMetaOutputSchema,
-} as const;
+});
 
 export const listReportTemplatesTool = {
   name: "list_report_templates",
@@ -119,13 +119,13 @@ const saveInputSchema = {
     ),
 } as const;
 
-const saveOutputSchema = {
+const saveOutputSchema = z.looseObject({
   templateId: z.string(),
   name: z.string(),
   created: z.boolean(),
   url: z.string(),
   ...optionalMetaOutputSchema,
-} as const;
+});
 
 export const saveReportTemplateTool = {
   name: "save_report_template",
@@ -173,6 +173,54 @@ export const saveReportTemplateTool = {
         text: `${created ? "Saved" : "Updated"} report template "${name}" (id ${templateId}) in this project. Pass templateId: "${templateId}" to save_report when you write a report from it. Manage templates at ${url}.`,
         meta: buildProjectMeta(context, args.projectId, path),
         structuredContent: { templateId, name, created, url },
+      });
+    },
+  ),
+};
+
+const deleteInputSchema = {
+  projectId: projectIdSchema,
+  templateId: z
+    .string()
+    .min(1)
+    .describe("Template id from list_report_templates."),
+} as const;
+
+export const deleteReportTemplateTool = {
+  name: "delete_report_template",
+  config: {
+    title: "Delete report template",
+    description:
+      "Permanently deletes one reusable report template from this project. Uses no credits. Call list_report_templates to find its templateId. Existing saved reports are kept.",
+    inputSchema: deleteInputSchema,
+    outputSchema: z.looseObject({
+      templateId: z.string(),
+      deleted: z.literal(true),
+      ...optionalMetaOutputSchema,
+    }),
+    annotations: {
+      readOnlyHint: false,
+      openWorldHint: false,
+      destructiveHint: true,
+    },
+  },
+  handler: withMcpProjectAuth(
+    async (args: z.infer<z.ZodObject<typeof deleteInputSchema>>, context) => {
+      await ReportTemplateService.deleteReportTemplate(
+        args.projectId,
+        args.templateId,
+      );
+      return mcpResponse({
+        text: `Deleted report template ${args.templateId}. Existing reports are kept.`,
+        meta: buildProjectMeta(
+          context,
+          args.projectId,
+          templatesPath(args.projectId),
+        ),
+        structuredContent: {
+          templateId: args.templateId,
+          deleted: true as const,
+        },
       });
     },
   ),

@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- application table declarations */
 import {
   sqliteTable,
   text,
@@ -41,6 +42,37 @@ export const userOnboardingAnswers = sqliteTable(
   ],
 );
 
+// The paid-social ad (utm_medium=paid_social) a hosted signup came from, read
+// from the UTM tags the marketing site carries onto the sign-up link.
+// Campaign-level tags only: no click ids or other per-person ad identifiers.
+// No row = not from a paid-social ad.
+export const userSignupCampaigns = sqliteTable("user_signup_campaigns", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => user.id, { onDelete: "cascade" }),
+  utmSource: text("utm_source"),
+  utmCampaign: text("utm_campaign"),
+  utmContent: text("utm_content"),
+});
+
+// A self-serve account deletion the user asked for. Sign-in is blocked while
+// the row exists; the daily cron erases the account once deleteAfter passes
+// (src/server/account-deletion). Both timestamps are ISO strings written by
+// the app, so they compare the same way on both dialects.
+export const accountDeletionRequests = sqliteTable(
+  "account_deletion_requests",
+  {
+    userId: text("user_id")
+      .primaryKey()
+      .references(() => user.id, { onDelete: "cascade" }),
+    requestedAt: text("requested_at").notNull(),
+    deleteAfter: text("delete_after").notNull(),
+  },
+  (table) => [
+    index("account_deletion_requests_delete_after_idx").on(table.deleteAfter),
+  ],
+);
+
 // Projects for keyword research
 export const projects = sqliteTable(
   "projects",
@@ -61,6 +93,12 @@ export const projects = sqliteTable(
     // Soft delete: archived projects are hidden everywhere but their data
     // (keywords, rank tracking, audits) is preserved.
     archivedAt: text("archived_at"),
+    // The Prompt Research keywords from AI visibility setup, one
+    // per line, most important first. Null until setup runs.
+    aiResearchKeywords: text("ai_research_keywords"),
+    // The IndexNow key the site hosts at /{key}.txt. Public by design, so it
+    // is stored as plain text. Null until IndexNow is first used.
+    indexnowKey: text("indexnow_key"),
   },
   (table) => [
     // Only the auto-created Default/null-domain project is a singleton. This
@@ -204,7 +242,8 @@ export const keywordMetrics = sqliteTable(
 // Rank Tracking tables
 // ============================================================================
 
-// One configuration per project+domain — defines what domain to track and how
+// One configuration per project+domain+location+language — defines what domain
+// to track and how
 export const rankTrackingConfigs = sqliteTable(
   "rank_tracking_configs",
   {
@@ -242,10 +281,16 @@ export const rankTrackingConfigs = sqliteTable(
       table.createdAt,
     ),
     uniqueIndex("rank_tracking_configs_national_idx")
-      .on(table.projectId, table.domain, table.locationCode)
+      .on(table.projectId, table.domain, table.locationCode, table.languageCode)
       .where(sql`${table.locationName} IS NULL`),
     uniqueIndex("rank_tracking_configs_local_idx")
-      .on(table.projectId, table.domain, table.locationCode, table.locationName)
+      .on(
+        table.projectId,
+        table.domain,
+        table.locationCode,
+        table.languageCode,
+        table.locationName,
+      )
       .where(sql`${table.locationName} IS NOT NULL`),
   ],
 );
@@ -269,6 +314,9 @@ export const rankTrackingKeywords = sqliteTable(
     keywordDifficulty: integer("keyword_difficulty"),
     cpc: real("cpc"),
     metricsFetchedAt: text("metrics_fetched_at"),
+    // Set when a user pins the keyword to the top of the tracker's table.
+    // Pins are shared by everyone in the project.
+    pinnedAt: text("pinned_at"),
     createdAt: text("created_at")
       .notNull()
       .default(sql`(current_timestamp)`),
@@ -377,13 +425,17 @@ export const organizationActivationState = sqliteTable(
 );
 
 // Per-project state for the dashboard's onboarding checklist. Most steps
-// complete via real product state (projects.domain, gsc_connections, MCP
-// activation); the competitor step completes on click-through.
+// complete via real product state (audits, teammates, MCP activation). The
+// competitor and keyword steps record the first domain overview or keyword
+// research run on the project, from the app or an agent; the column names
+// predate that. The checklist counts a step done on any of the workspace's
+// projects.
 export const projectActivationState = sqliteTable("project_activation_state", {
   projectId: text("project_id")
     .primaryKey()
     .references(() => projects.id, { onDelete: "cascade" }),
-  competitorStepClickedAt: text("competitor_step_clicked_at"),
+  competitorResearchedAt: text("competitor_step_clicked_at"),
+  keywordResearchedAt: text("keyword_step_clicked_at"),
   // "I already connected" on the MCP card: hides the card for this project
   // without faking the org-level first-tool-call milestone, which stays
   // truthful and self-heals when a real external call lands.
@@ -396,11 +448,8 @@ export const projectActivationState = sqliteTable("project_activation_state", {
     .default(sql`(current_timestamp)`),
 });
 
-// Point-in-time backlink profile summaries for the project's own domain,
-// written by the dashboard's visit-triggered refresh. DataForSEO's summary
-// already carries new/lost counts, so one snapshot renders a full card;
-// rows accumulate into history for future trend views. The domain is stored
-// per row so a later project-domain change doesn't rewrite history.
+// Retained backlink profile history. The dashboard no longer writes snapshots.
+// Each row keeps its original domain when the project website changes.
 export const backlinkSnapshots = sqliteTable(
   "backlink_snapshots",
   {
@@ -446,3 +495,38 @@ export const dashboardStepDismissals = sqliteTable(
     index("dashboard_step_dismissals_project_idx").on(table.projectId),
   ],
 );
+
+// Crawler-access credentials for one host (currently only Shopify's
+// domain-scoped crawler signature). Stored on the project (website) it was
+// added for; an audit looks across the organization's projects, so a second
+// project auditing the same store still picks it up. The signature values are
+// encrypted, and never returned to the client.
+export const crawlerCredentials = sqliteTable(
+  "crawler_credentials",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Normalized lowercase hostname, e.g. "www.store.com".
+    host: text("host").notNull(),
+    provider: text("provider", { enum: ["shopify"] }).notNull(),
+    signatureInput: text("signature_input").notNull(),
+    signature: text("signature").notNull(),
+    // Parsed from the RFC 9421 `expires=` parameter when present; null when
+    // the signature input carries no expiry.
+    expiresAt: text("expires_at"),
+    createdByUserId: text("created_by_user_id"),
+    createdAt: text("created_at")
+      .notNull()
+      .default(sql`(current_timestamp)`),
+  },
+  (table) => [
+    uniqueIndex("crawler_credentials_project_host_idx").on(
+      table.projectId,
+      table.host,
+    ),
+  ],
+);
+
+export { dataRefreshClaims } from "./dashboard.schema";
