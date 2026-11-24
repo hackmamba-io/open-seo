@@ -14,8 +14,9 @@ export const MAX_GOTO_URLS_PER_REQUEST = 100;
 
 /**
  * The real page behind each google.com/goto URL, keyed by that URL. A URL
- * DataForSEO couldn't resolve is left out. POST /v3/appendix/goto_url_converter
- * is free, so like fetchUserData this is deliberately not metered.
+ * DataForSEO couldn't resolve is left out. Starting November 30, 2026,
+ * DataForSEO charges $0.001 per request. The deployment absorbs this cost
+ * for the manual rank check fallback so it stays outside the credit meter.
  */
 export async function resolveGotoUrls(
   gotoUrls: string[],

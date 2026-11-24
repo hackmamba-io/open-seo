@@ -290,7 +290,6 @@ export async function runQueuedTasks(
             languageCode: ctx.languageCode,
             locationName: ctx.locationName,
             depth: ctx.serpDepth,
-            targetDomain: ctx.domain,
           }),
         )),
       );

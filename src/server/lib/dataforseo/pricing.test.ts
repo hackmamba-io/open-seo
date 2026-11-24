@@ -159,7 +159,6 @@ describe("dataforseoPricing", () => {
       })),
       ...location,
       depth: 20,
-      targetDomain: "example.com",
     });
     // The estimate is the worst case: this post plus two queued retries.
     expect(3 * creditsForProviderUsd(estimateUsd)).toBe(
@@ -181,7 +180,6 @@ describe("dataforseoPricing", () => {
       tasks: [{ keyword, keywordId: "id", device: "desktop" }],
       ...location,
       depth: 20,
-      targetDomain: "example.com",
     });
     // The estimate is the worst case: the live call plus two queued retries.
     expect(
