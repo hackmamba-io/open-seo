@@ -86,7 +86,9 @@ const activeRun = {
   status: "running",
 };
 
-const payload = {
+type RankCheckPayload = Parameters<RankCheckWorkflow["run"]>[0]["payload"];
+
+const payload: RankCheckPayload = {
   runId: "run_1",
   configId: "config_1",
   billingCustomer,
@@ -94,9 +96,9 @@ const payload = {
   domain: "example.com",
   locationCode: 2840,
   languageCode: "en",
-  devices: "desktop" as "desktop" | "mobile" | "both",
+  devices: "desktop",
   serpDepth: 10,
-  trigger: "manual" as const,
+  trigger: "manual",
 };
 
 function keywords(count: number) {
@@ -106,9 +108,7 @@ function keywords(count: number) {
   }));
 }
 
-function runWorkflow(
-  overrides: Partial<typeof payload> & { maxCostCredits?: number },
-) {
+function runWorkflow(overrides: Partial<RankCheckPayload>) {
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the mocked base class does not inspect Worker constructor context
   const workflow = new RankCheckWorkflow({} as ExecutionContext, {} as Env);
   return workflow.run(
@@ -317,6 +317,18 @@ describe("rank check goto URLs", () => {
     await runWorkflow({});
 
     expect(mocks.updateSnapshotUrls).toHaveBeenCalledExactlyOnceWith([]);
+  });
+
+  it("uses the queued SERP URLs for scheduled runs without calling the converter", async () => {
+    mocks.getSnapshotsForRun.mockResolvedValue([gotoSnapshot(1)]);
+
+    await runWorkflow({ trigger: "scheduled" });
+
+    expect(mocks.resolveGotoUrls).not.toHaveBeenCalled();
+    expect(mocks.updateRun).toHaveBeenCalledWith(
+      "run_1",
+      expect.objectContaining({ status: "completed", errorMessage: null }),
+    );
   });
 
   it("splits a large run across converter requests", async () => {

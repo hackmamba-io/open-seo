@@ -10,6 +10,7 @@ import { DataforseoChargedTaskError } from "@/server/lib/dataforseo/envelope";
 import {
   fetchLiveSerp,
   fetchLocalSerpTaskResult,
+  fetchRankCheckSerp,
   fetchRankCheckTaskResult,
   postLocalSerpTasks,
   postRankCheckTasks,
@@ -60,6 +61,51 @@ describe("live SERP", () => {
   });
 });
 
+it("checks a live rank at the requested depth without retired crawl controls", async () => {
+  const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+    Response.json({
+      status_code: 20000,
+      tasks: [
+        {
+          status_code: 20000,
+          path: ["v3", "serp", "google", "organic", "live", "advanced"],
+          cost: 0.0035,
+          result: [
+            {
+              items: [
+                { type: "organic", domain: "www.example.com", rank_group: 12 },
+              ],
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+
+  const result = await fetchRankCheckSerp({
+    keyword: "alpha",
+    keywordId: "kw-1",
+    locationCode: 2840,
+    languageCode: "en",
+    device: "desktop",
+    targetDomain: "example.com",
+    depth: 20,
+  });
+
+  expect(parseDataforseoRequestBody(fetchMock.mock.calls[0]?.[1])).toEqual([
+    {
+      keyword: "alpha",
+      location_code: 2840,
+      language_code: "en",
+      device: "desktop",
+      os: "windows",
+      depth: 20,
+    },
+  ]);
+  expect(result.data.position).toBe(12);
+});
+
 describe("rank check task queue", () => {
   it("posts queued tasks, maps ids by tag, and sums cost over all entries", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
@@ -99,7 +145,6 @@ describe("rank check task queue", () => {
       locationCode: 2840,
       languageCode: "en",
       depth: 20,
-      targetDomain: "example.com",
     });
 
     expect(
@@ -110,18 +155,11 @@ describe("rank check task queue", () => {
       ),
     ).toEqual(["https://api.dataforseo.com/v3/serp/google/organic/task_post"]);
 
-    // Every posted task asks DataForSEO to stop crawling at the target's
-    // organic listing — that is what cuts the actual crawl cost for ranking
-    // domains without false "not ranking" stops on sitelinks/PAA mentions.
-    const stopCrawl = {
-      stop_crawl_on_match: [
-        { match_value: "example.com", match_type: "with_subdomains" },
-      ],
-      find_targets_in: ["organic"],
-    };
-    expect(
-      parseDataforseoRequestBody(fetchMock.mock.calls[0]?.[1]),
-    ).toMatchObject([stopCrawl, stopCrawl, stopCrawl]);
+    const body = parseDataforseoRequestBody(fetchMock.mock.calls[0]?.[1]);
+    expect(body).toMatchObject([{ depth: 20 }, { depth: 20 }, { depth: 20 }]);
+    expect(JSON.stringify(body)).not.toMatch(
+      /"(?:stop_crawl_on_match|target_search_mode|find_targets_in|ignore_targets_in)"/,
+    );
     expect(result.data).toEqual([
       {
         keyword: "alpha",

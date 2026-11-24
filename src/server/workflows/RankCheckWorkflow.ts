@@ -429,16 +429,22 @@ export class RankCheckWorkflow extends WorkflowEntrypoint<
         console.warn(`[rank-check] ${runId} partial failure: ${batchError}`);
       }
 
-      try {
-        await pgStep(step, "resolve-goto-urls", FREE_STEP_CONFIG, () =>
-          resolveRunGotoUrls(runId),
-        );
-      } catch (error) {
-        // The positions are saved and the goto links still work, so this
-        // doesn't fail the run.
-        console.warn(
-          `[rank-check] ${runId} goto URLs not resolved: ${describeError(error)}`,
-        );
+      // Normal-priority queued checks already include URL resolution. For
+      // manual runs, resolve any remaining redirects after saving the live
+      // results so URL resolution doesn't delay rank-check progress.
+      if (trigger === "manual") {
+        try {
+          await pgStep(
+            step,
+            "resolve-goto-urls",
+            { ...FREE_STEP_CONFIG, retries: { limit: 0, delay: "10 seconds" } },
+            () => resolveRunGotoUrls(runId),
+          );
+        } catch (error) {
+          console.warn(
+            `[rank-check] ${runId} goto URLs not resolved: ${describeError(error)}`,
+          );
+        }
       }
 
       await pgStep(step, "finalize", FREE_STEP_CONFIG, async () =>
